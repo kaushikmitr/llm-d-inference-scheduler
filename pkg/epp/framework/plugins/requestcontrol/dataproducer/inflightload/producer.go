@@ -443,7 +443,7 @@ func (p *InFlightLoadProducer) Produces() map[string]any {
 
 func (p *InFlightLoadProducer) Consumes() map[string]any {
 	return map[string]any{
-		attrprefix.PrefixCacheMatchInfoKey: (*attrprefix.PrefixCacheMatchInfo)(nil),
+		attrprefix.PrefixCacheMatchInfoKey: attrprefix.PrefixCacheMatchInfo{},
 	}
 }
 
