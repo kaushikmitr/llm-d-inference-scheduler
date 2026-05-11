@@ -31,7 +31,8 @@ import (
 
 	logutil "github.com/llm-d/llm-d-inference-scheduler/pkg/common/observability/logging"
 	fwkplugin "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/interface/plugin"
-	framework "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/interface/scheduling"
+	fwksched "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/interface/scheduling"
+	attrconcurrency "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
 	attrlatency "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/plugins/datalayer/attribute/latency"
 	attrprefix "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/plugins/datalayer/attribute/prefix"
 )
@@ -40,7 +41,7 @@ const (
 	PluginType = "prefix-cache-affinity-filter"
 )
 
-var _ framework.Filter = &Plugin{}
+var _ fwksched.Filter = &Plugin{}
 
 type Config struct {
 	// AffinityThreshold is the prefix cache score threshold. Endpoints with
@@ -56,6 +57,12 @@ type Config struct {
 	// endpoint's predicted TTFT by more than this value, all endpoints are kept.
 	// Set to 0 to always stick. Default: 5000.
 	MaxTTFTPenaltyMs float64 `json:"maxTTFTPenaltyMs,omitempty"`
+
+	// MaxTokensInFlightPenalty is the max in-flight token penalty before breaking
+	// stickiness. If the best sticky endpoint's in-flight tokens exceed the best
+	// non-sticky endpoint's in-flight tokens by more than this value, all endpoints
+	// are kept. Set to 0 to disable this gate. Default: 0 (disabled).
+	MaxTokensInFlightPenalty int64 `json:"maxTokensInFlightPenalty,omitempty"`
 }
 
 var DefaultConfig = Config{
@@ -95,6 +102,9 @@ func (c *Config) validate() error {
 	if c.MaxTTFTPenaltyMs < 0 {
 		return fmt.Errorf("maxTTFTPenaltyMs must be >= 0, got %f", c.MaxTTFTPenaltyMs)
 	}
+	if c.MaxTokensInFlightPenalty < 0 {
+		return fmt.Errorf("maxTokensInFlightPenalty must be >= 0, got %d", c.MaxTokensInFlightPenalty)
+	}
 	return nil
 }
 
@@ -102,7 +112,7 @@ func (p *Plugin) TypedName() fwkplugin.TypedName {
 	return p.typedName
 }
 
-func (p *Plugin) Filter(ctx context.Context, _ *framework.CycleState, _ *framework.InferenceRequest, endpoints []framework.Endpoint) []framework.Endpoint {
+func (p *Plugin) Filter(ctx context.Context, _ *fwksched.CycleState, _ *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) []fwksched.Endpoint {
 	logger := log.FromContext(ctx)
 
 	if len(endpoints) <= 1 || p.config.AffinityThreshold <= 0 {
@@ -117,7 +127,7 @@ func (p *Plugin) Filter(ctx context.Context, _ *framework.CycleState, _ *framewo
 	}
 
 	// Find sticky and non-sticky endpoints.
-	var sticky, nonSticky []framework.Endpoint
+	var sticky, nonSticky []fwksched.Endpoint
 	for _, ep := range endpoints {
 		if prefixCacheScore(ep) >= p.config.AffinityThreshold {
 			sticky = append(sticky, ep)
@@ -145,6 +155,18 @@ func (p *Plugin) Filter(ctx context.Context, _ *framework.CycleState, _ *framewo
 		}
 	}
 
+	// In-flight tokens load gate: break stickiness if sticky endpoints are too loaded.
+	if p.config.MaxTokensInFlightPenalty > 0 && len(nonSticky) > 0 {
+		bestStickyTokens := bestInFlightTokens(sticky)
+		bestNonStickyTokens := bestInFlightTokens(nonSticky)
+		if bestStickyTokens-bestNonStickyTokens > p.config.MaxTokensInFlightPenalty {
+			logger.V(logutil.DEBUG).Info("PrefixCacheAffinityFilter: in-flight tokens load gate broken",
+				"bestStickyTokens", bestStickyTokens, "bestNonStickyTokens", bestNonStickyTokens,
+				"penalty", bestStickyTokens-bestNonStickyTokens, "maxPenalty", p.config.MaxTokensInFlightPenalty)
+			return endpoints
+		}
+	}
+
 	logger.V(logutil.DEBUG).Info("PrefixCacheAffinityFilter: narrowed to sticky",
 		"affinityThreshold", p.config.AffinityThreshold, "sticky", len(sticky), "total", len(endpoints))
 	return sticky
@@ -154,10 +176,11 @@ func (p *Plugin) Consumes() map[string]any {
 	return map[string]any{
 		attrlatency.LatencyPredictionInfoKey: attrlatency.LatencyPredictionInfo{},
 		attrprefix.PrefixCacheMatchInfoKey:   attrprefix.PrefixCacheMatchInfo{},
+		attrconcurrency.InFlightLoadKey:      attrconcurrency.InFlightLoad{},
 	}
 }
 
-func prefixCacheScore(ep framework.Endpoint) float64 {
+func prefixCacheScore(ep fwksched.Endpoint) float64 {
 	if raw, ok := ep.Get(attrprefix.PrefixCacheMatchInfoKey); ok {
 		info := raw.(*attrprefix.PrefixCacheMatchInfo)
 		if info.TotalBlocks() > 0 {
@@ -170,7 +193,7 @@ func prefixCacheScore(ep framework.Endpoint) float64 {
 	return 0
 }
 
-func bestTTFT(endpoints []framework.Endpoint) float64 {
+func bestTTFT(endpoints []fwksched.Endpoint) float64 {
 	best := math.MaxFloat64
 	for _, ep := range endpoints {
 		if raw, ok := ep.Get(attrlatency.LatencyPredictionInfoKey); ok {
@@ -178,6 +201,24 @@ func bestTTFT(endpoints []framework.Endpoint) float64 {
 			if info.TTFT() < best {
 				best = info.TTFT()
 			}
+		}
+	}
+	return best
+}
+
+// bestInFlightTokens returns the lowest in-flight token count across endpoints.
+// Endpoints without the attribute are treated as 0 (no observed load).
+func bestInFlightTokens(endpoints []fwksched.Endpoint) int64 {
+	best := int64(math.MaxInt64)
+	for _, ep := range endpoints {
+		var tokens int64
+		if raw, ok := ep.Get(attrconcurrency.InFlightLoadKey); ok {
+			if load, ok := raw.(*attrconcurrency.InFlightLoad); ok && load != nil {
+				tokens = load.Tokens
+			}
+		}
+		if tokens < best {
+			best = tokens
 		}
 	}
 	return best

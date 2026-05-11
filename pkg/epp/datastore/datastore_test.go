@@ -43,7 +43,7 @@ import (
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/datalayer"
 	fwkdl "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/epp/framework/plugins/datalayer/source/mocks"
-	pooltuil "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/util/pool"
+	poolutil "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/util/pool"
 	testutil "github.com/llm-d/llm-d-inference-scheduler/pkg/epp/util/testing"
 )
 
@@ -129,12 +129,12 @@ func TestPool(t *testing.T) {
 					Build()
 
 				ds := NewDatastore(context.Background(), epf, 0)
-				_ = ds.PoolSet(context.Background(), fakeClient, pooltuil.InferencePoolToEndpointPool(tt.inferencePool))
+				_ = ds.PoolSet(context.Background(), fakeClient, poolutil.InferencePoolToEndpointPool(tt.inferencePool))
 				gotPool, gotErr := ds.PoolGet()
 				if diff := cmp.Diff(tt.wantErr, gotErr, cmpopts.EquateErrors()); diff != "" {
 					t.Errorf("Unexpected error diff (+got/-want): %s", diff)
 				}
-				if diff := cmp.Diff(pooltuil.InferencePoolToEndpointPool(tt.wantPool), gotPool); diff != "" {
+				if diff := cmp.Diff(poolutil.InferencePoolToEndpointPool(tt.wantPool), gotPool); diff != "" {
 					t.Errorf("Unexpected pool diff (+got/-want): %s", diff)
 				}
 				gotSynced := ds.PoolHasSynced()
@@ -386,7 +386,7 @@ func TestMetrics(t *testing.T) {
 					WithScheme(scheme).
 					Build()
 				ds := NewDatastore(ctx, epf, 0)
-				_ = ds.PoolSet(ctx, fakeClient, pooltuil.InferencePoolToEndpointPool(inferencePool))
+				_ = ds.PoolSet(ctx, fakeClient, poolutil.InferencePoolToEndpointPool(inferencePool))
 				for _, pod := range test.storePods {
 					ds.PodUpdateOrAddIfNotExist(ctx, pod)
 				}
@@ -461,7 +461,7 @@ func TestPods(t *testing.T) {
 				ctx := context.Background()
 				ds := NewDatastore(t.Context(), epf, 0)
 				fakeClient := fake.NewFakeClient()
-				if err := ds.PoolSet(ctx, fakeClient, pooltuil.InferencePoolToEndpointPool(inferencePool)); err != nil {
+				if err := ds.PoolSet(ctx, fakeClient, poolutil.InferencePoolToEndpointPool(inferencePool)); err != nil {
 					t.Error(err)
 				}
 				for _, pod := range test.existingPods {
@@ -556,7 +556,7 @@ func TestTargetPortsChange(t *testing.T) {
 					Selector(map[string]string{"app": "vllm"}).ObjRef()
 				initialPool.Spec.TargetPorts = test.initialTargetPorts
 
-				if err := ds.PoolSet(ctx, fakeClient, pooltuil.InferencePoolToEndpointPool(initialPool)); err != nil {
+				if err := ds.PoolSet(ctx, fakeClient, poolutil.InferencePoolToEndpointPool(initialPool)); err != nil {
 					t.Fatalf("Failed to set initial pool: %v", err)
 				}
 
@@ -572,7 +572,7 @@ func TestTargetPortsChange(t *testing.T) {
 					Selector(map[string]string{"app": "vllm"}).ObjRef()
 				updatedPool.Spec.TargetPorts = test.updatedTargetPorts
 
-				if err := ds.PoolSet(ctx, fakeClient, pooltuil.InferencePoolToEndpointPool(updatedPool)); err != nil {
+				if err := ds.PoolSet(ctx, fakeClient, poolutil.InferencePoolToEndpointPool(updatedPool)); err != nil {
 					t.Fatalf("Failed to set updated pool: %v", err)
 				}
 
@@ -764,7 +764,7 @@ func TestEndpointMetadata(t *testing.T) {
 				ctx := context.Background()
 				ds := NewDatastore(t.Context(), epf, 0)
 				fakeClient := fake.NewFakeClient()
-				if err := ds.PoolSet(ctx, fakeClient, pooltuil.InferencePoolToEndpointPool(test.pool)); err != nil {
+				if err := ds.PoolSet(ctx, fakeClient, poolutil.InferencePoolToEndpointPool(test.pool)); err != nil {
 					t.Error(err)
 				}
 				for _, pod := range test.existingPods {
@@ -792,7 +792,7 @@ func TestActivePortFiltering(t *testing.T) {
 			Namespace: "default",
 			Labels:    map[string]string{"app": "vllm"},
 			Annotations: map[string]string{
-				"inference.networking.k8s.io/active-ports": "8000,8002",
+				activePortsAnnotation: "8000,8002",
 			},
 		},
 		Status: corev1.PodStatus{
@@ -827,7 +827,7 @@ func TestActivePortFiltering(t *testing.T) {
 			Namespace: "default",
 			Labels:    map[string]string{"app": "vllm"},
 			Annotations: map[string]string{
-				"inference.networking.k8s.io/active-ports": "",
+				activePortsAnnotation: "",
 			},
 		},
 		Status: corev1.PodStatus{
@@ -920,7 +920,7 @@ func TestActivePortFiltering(t *testing.T) {
 				// Use the first pool in the test
 				if len(test.pools) > 0 {
 					pool := test.pools[0]
-					if err := ds.PoolSet(ctx, fakeClient, pooltuil.InferencePoolToEndpointPool(&pool)); err != nil {
+					if err := ds.PoolSet(ctx, fakeClient, poolutil.InferencePoolToEndpointPool(&pool)); err != nil {
 						t.Fatalf("Failed to set pool: %v", err)
 					}
 				}
@@ -959,7 +959,7 @@ func TestActivePortEndpointRemoval(t *testing.T) {
 			Namespace: "default",
 			Labels:    map[string]string{"app": "vllm"},
 			Annotations: map[string]string{
-				"inference.networking.k8s.io/active-ports": "8000,8001,8002",
+				activePortsAnnotation: "8000,8001,8002",
 			},
 		},
 		Status: corev1.PodStatus{
@@ -978,7 +978,7 @@ func TestActivePortEndpointRemoval(t *testing.T) {
 			Namespace: "default",
 			Labels:    map[string]string{"app": "vllm"},
 			Annotations: map[string]string{
-				"inference.networking.k8s.io/active-ports": "8000",
+				activePortsAnnotation: "8000",
 			},
 		},
 		Status: corev1.PodStatus{
@@ -997,7 +997,7 @@ func TestActivePortEndpointRemoval(t *testing.T) {
 			Namespace: "default",
 			Labels:    map[string]string{"app": "vllm"},
 			Annotations: map[string]string{
-				"inference.networking.k8s.io/active-ports": "",
+				activePortsAnnotation: "",
 			},
 		},
 		Status: corev1.PodStatus{
@@ -1071,7 +1071,7 @@ func TestActivePortEndpointRemoval(t *testing.T) {
 				ds := NewDatastore(ctx, epf, 0)
 
 				// Set up the pool
-				if err := ds.PoolSet(ctx, fakeClient, pooltuil.InferencePoolToEndpointPool(test.pool)); err != nil {
+				if err := ds.PoolSet(ctx, fakeClient, poolutil.InferencePoolToEndpointPool(test.pool)); err != nil {
 					t.Fatalf("Failed to set pool: %v", err)
 				}
 
@@ -1125,7 +1125,7 @@ func TestPodUpdateOrAddIfNotExist_ConcurrentPoolSet(t *testing.T) {
 			ctx := context.Background()
 			ds := NewDatastore(ctx, epf, 0)
 
-			pool := pooltuil.InferencePoolToEndpointPool(
+			pool := poolutil.InferencePoolToEndpointPool(
 				testutil.MakeInferencePool("pool1").
 					Namespace("default").
 					Selector(map[string]string{"app": "vllm"}).
@@ -1283,6 +1283,33 @@ func TestExtractActivePorts(t *testing.T) {
 					Name:        "test-pod",
 					Namespace:   "default",
 					Annotations: map[string]string{activePortsAnnotation: "8000,9000"},
+				},
+			},
+			validPorts:    []int{8000, 8001, 8002},
+			expectedPorts: sets.New(8000),
+		},
+		{
+			name: "Pod with legacy GAIE annotation key",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "test-pod",
+					Namespace:   "default",
+					Annotations: map[string]string{legacyGAIEActivePortsAnnotation: "8000,8001"},
+				},
+			},
+			validPorts:    []int{8000, 8001, 8002},
+			expectedPorts: sets.New(8000, 8001),
+		},
+		{
+			name: "New annotation key takes precedence over legacy GAIE key",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-pod",
+					Namespace: "default",
+					Annotations: map[string]string{
+						activePortsAnnotation:           "8000",
+						legacyGAIEActivePortsAnnotation: "8001",
+					},
 				},
 			},
 			validPorts:    []int{8000, 8001, 8002},
