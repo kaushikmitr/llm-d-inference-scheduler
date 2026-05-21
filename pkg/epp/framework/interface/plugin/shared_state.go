@@ -33,3 +33,12 @@ type StateData interface {
 	// Clone is an interface to make a copy of StateData.
 	Clone() StateData
 }
+
+// EvictableStateData is an optional interface for StateData that needs
+// to perform cleanup logic when it is removed or expires.
+type EvictableStateData interface {
+	StateData
+	// OnEvicted is called when the data is removed from PluginState,
+	// either manually or by the janitor.
+	OnEvicted(requestID string, key StateKey)
+}

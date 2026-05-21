@@ -95,8 +95,38 @@ func (s *PluginState) Write(requestID string, key StateKey, val StateData) {
 // or alternatively, if the request failed during its processing, a cleanup goroutine will
 // clean data of stale requests.
 func (s *PluginState) Delete(requestID string) {
-	s.storage.Delete(requestID)
-	s.requestToLastAccessTime.Delete(requestID)
+	if val, ok := s.storage.LoadAndDelete(requestID); ok {
+		s.requestToLastAccessTime.Delete(requestID)
+
+		stateData := val.(*sync.Map)
+		stateData.Range(func(k, v any) bool {
+			if evictable, ok := v.(EvictableStateData); ok {
+				evictable.OnEvicted(requestID, k.(StateKey))
+			}
+			return true
+		})
+	}
+}
+
+// DeleteKey deletes the data associated with the given "key" in the context of "requestID" from PluginState.
+func (s *PluginState) DeleteKey(requestID string, key StateKey) {
+	stateMap, ok := s.storage.Load(requestID)
+	if !ok {
+		return
+	}
+
+	stateData := stateMap.(*sync.Map)
+	if val, ok := stateData.LoadAndDelete(key); ok {
+		if evictable, ok := val.(EvictableStateData); ok {
+			evictable.OnEvicted(requestID, key)
+		}
+	}
+}
+
+// Touch updates the last access time for the given requestID, extending its
+// lifetime before being reaped by the janitor.
+func (s *PluginState) Touch(requestID string) {
+	s.requestToLastAccessTime.Store(requestID, time.Now())
 }
 
 // cleanup periodically deletes data associated with the given requestID.

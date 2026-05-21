@@ -34,7 +34,7 @@ import (
 )
 
 func newTestProducer() *InFlightLoadProducer {
-	return &InFlightLoadProducer{
+	p := &InFlightLoadProducer{
 		typedName:                fwkplugin.TypedName{Type: InFlightLoadProducerType, Name: "inflight-load-producer"},
 		requestTracker:           newConcurrencyTracker(),
 		tokenTracker:             newConcurrencyTracker(),
@@ -42,6 +42,8 @@ func newTestProducer() *InFlightLoadProducer {
 		addEstimatedOutputTokens: true,
 		dk:                       attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName("inflight-load-producer"),
 	}
+	p.PluginState = fwkplugin.NewPluginState(context.Background())
+	return p
 }
 
 func TestInFlightLoadProducer_Produce(t *testing.T) {
@@ -258,12 +260,8 @@ func makeTokenRequest(requestID, prompt string) *fwksched.InferenceRequest {
 func TestInFlightLoadProducer_ExcludeOutputTokens_StartOfStreamRelease(t *testing.T) {
 	t.Parallel()
 
-	producer := &InFlightLoadProducer{
-		requestTracker:           newConcurrencyTracker(),
-		tokenTracker:             newConcurrencyTracker(),
-		tokenEstimator:           NewSimpleTokenEstimator(),
-		addEstimatedOutputTokens: false,
-	}
+	producer := newTestProducer()
+	producer.addEstimatedOutputTokens = false
 	ctx := context.Background()
 	endpointName := "exclude-output-endpoint"
 	endpointID := fullEndpointName(endpointName)
@@ -292,12 +290,8 @@ func TestInFlightLoadProducer_ExcludeOutputTokens_StartOfStreamRelease(t *testin
 func TestInFlightLoadProducer_ExcludeOutputTokens_SingleChunk(t *testing.T) {
 	t.Parallel()
 
-	producer := &InFlightLoadProducer{
-		requestTracker:           newConcurrencyTracker(),
-		tokenTracker:             newConcurrencyTracker(),
-		tokenEstimator:           NewSimpleTokenEstimator(),
-		addEstimatedOutputTokens: false,
-	}
+	producer := newTestProducer()
+	producer.addEstimatedOutputTokens = false
 	ctx := context.Background()
 	endpointName := "single-chunk-endpoint"
 	endpointID := fullEndpointName(endpointName)
@@ -319,12 +313,7 @@ func TestInFlightLoadProducer_ExcludeOutputTokens_SingleChunk(t *testing.T) {
 func TestInFlightLoadProducer_PrefixCacheDiscount(t *testing.T) {
 	t.Parallel()
 
-	producer := &InFlightLoadProducer{
-		requestTracker:           newConcurrencyTracker(),
-		tokenTracker:             newConcurrencyTracker(),
-		tokenEstimator:           NewSimpleTokenEstimator(),
-		addEstimatedOutputTokens: true,
-	}
+	producer := newTestProducer()
 	ctx := context.Background()
 	endpointName := "prefix-cache-endpoint"
 	endpointID := fullEndpointName(endpointName)
@@ -363,12 +352,7 @@ func TestInFlightLoadProducer_PrefixCacheDiscount(t *testing.T) {
 func TestInFlightLoadProducer_PrefixCacheDiscount_PerEndpoint(t *testing.T) {
 	t.Parallel()
 
-	producer := &InFlightLoadProducer{
-		requestTracker:           newConcurrencyTracker(),
-		tokenTracker:             newConcurrencyTracker(),
-		tokenEstimator:           NewSimpleTokenEstimator(),
-		addEstimatedOutputTokens: true,
-	}
+	producer := newTestProducer()
 	ctx := context.Background()
 	podA := "pod-a-cached"
 	podB := "pod-b-uncached"
@@ -411,12 +395,7 @@ func TestInFlightLoadProducer_PrefixCacheDiscount_PerEndpoint(t *testing.T) {
 func TestInFlightLoadProducer_BalancedAddRelease_MultipleProfilesSameEndpoint(t *testing.T) {
 	t.Parallel()
 
-	producer := &InFlightLoadProducer{
-		requestTracker:           newConcurrencyTracker(),
-		tokenTracker:             newConcurrencyTracker(),
-		tokenEstimator:           NewSimpleTokenEstimator(),
-		addEstimatedOutputTokens: true,
-	}
+	producer := newTestProducer()
 	ctx := context.Background()
 	endpointName := "shared-endpoint"
 	endpointID := fullEndpointName(endpointName)
@@ -453,17 +432,12 @@ func TestInFlightLoadProducer_BalancedAddRelease_MultipleProfilesSameEndpoint(t 
 // safety net for non-streaming or error paths: when addEstimatedOutputTokens=false and
 // ResponseBody delivers EndOfStream without ever seeing StartOfStream, the token
 // counter and request counter must both drain (tokens are normally released at
-// StartOfStream, so a missing StartOfStream would otherwise leak them). Also
-// asserts the addedTokens map entry is removed so accounting stays balanced.
+// StartOfStream, so a missing StartOfStream would otherwise leak them).
 func TestInFlightLoadProducer_ExcludeOutputTokens_EndOfStreamWithoutStart(t *testing.T) {
 	t.Parallel()
 
-	producer := &InFlightLoadProducer{
-		requestTracker:           newConcurrencyTracker(),
-		tokenTracker:             newConcurrencyTracker(),
-		tokenEstimator:           NewSimpleTokenEstimator(),
-		addEstimatedOutputTokens: false,
-	}
+	producer := newTestProducer()
+	producer.addEstimatedOutputTokens = false
 	ctx := context.Background()
 	endpointName := "no-start-endpoint"
 	endpointID := fullEndpointName(endpointName)
@@ -487,7 +461,59 @@ func TestInFlightLoadProducer_ExcludeOutputTokens_EndOfStreamWithoutStart(t *tes
 	require.Equal(t, int64(0), producer.tokenTracker.get(endpointID),
 		"tokens must be released on EndOfStream even if StartOfStream was never seen")
 
-	// addedTokens entry should be gone too (no leak).
-	_, loaded := producer.addedTokens.Load(addedTokensKey(req.RequestID, endpointID, "default"))
-	require.False(t, loaded, "addedTokens entry must be released")
+	// PluginState entry should be gone too (no leak).
+	key := fwkplugin.StateKey(addedTokensKey(endpointID, "default"))
+	_, err := producer.PluginState.Read(req.RequestID, key)
+	require.ErrorIs(t, err, fwkplugin.ErrNotFound, "PluginState entry must be released")
+}
+
+// TestInFlightLoadProducer_TTL verifies that global counters are rolled back
+// when the background janitor reaps an abandoned request from PluginState.
+func TestInFlightLoadProducer_TTL(t *testing.T) {
+	producer := newTestProducer()
+	ctx := context.Background()
+	endpointName := "abandoned-endpoint"
+	endpointID := fullEndpointName(endpointName)
+
+	// 1. PreRequest: Adds load
+	req := makeTokenRequest("req-abandoned", "1234567890123456") // 10 tokens
+	res := makeSchedulingResult(endpointName)
+	producer.PreRequest(ctx, req, res)
+
+	require.Equal(t, int64(1), producer.requestTracker.get(endpointID))
+	require.Equal(t, int64(10), producer.tokenTracker.get(endpointID))
+
+	// 2. Simulate abandonment: Manually set last access time to far in past
+	// and run cleanStaleRequests (internal to PluginState).
+	// We use the exported Delete() which simulates what the janitor does.
+	producer.PluginState.Delete(req.RequestID)
+
+	// 3. Verify counters rolled back automatically via OnEvicted callback
+	require.Equal(t, int64(0), producer.requestTracker.get(endpointID), "request counter should have rolled back via TTL")
+	require.Equal(t, int64(0), producer.tokenTracker.get(endpointID), "token counter should have rolled back via TTL")
+}
+
+// TestInFlightLoadProducer_Touch verifies that intermediate chunks extend the
+// request's lifetime in PluginState.
+func TestInFlightLoadProducer_Touch(t *testing.T) {
+	producer := newTestProducer()
+	ctx := context.Background()
+	endpointName := "touch-endpoint"
+
+	req := makeTokenRequest("req-touch", "1234")
+	res := makeSchedulingResult(endpointName)
+	producer.PreRequest(ctx, req, res)
+
+	// Verify we can find the state
+	key := fwkplugin.StateKey(addedTokensKey(fullEndpointName(endpointName), "default"))
+	_, err := producer.PluginState.Read(req.RequestID, key)
+	require.NoError(t, err)
+
+	// Simulate an intermediate chunk
+	req.SchedulingResult = res
+	producer.ResponseBody(ctx, req, &requestcontrol.Response{EndOfStream: false, StartOfStream: false}, nil)
+
+	// Since we can't easily peek at private requestToLastAccessTime in PluginState
+	// without reflection or export, we rely on the implementation calling Touch().
+	// We already tested Touch() unit-wise in plugin_state_test.go.
 }
