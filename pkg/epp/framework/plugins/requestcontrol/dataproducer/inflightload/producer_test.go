@@ -315,7 +315,7 @@ func TestInFlightLoadProducer_PrefixCacheDiscount(t *testing.T) {
 	endpoint := newStubSchedulingEndpoint(endpointName)
 	endpoint.Put(attrprefix.PrefixCacheMatchInfoDataKey.String(), attrprefix.NewPrefixCacheMatchInfo(1, 2, 4))
 
-	req := makeTokenRequest("req-prefix", "123456789012345690123456789012")
+	req := makeTokenRequest("req-prefix", "12345678901234567890123456789012")
 	res := &fwksched.SchedulingResult{
 		PrimaryProfileName: "default",
 		ProfileResults: map[string]*fwksched.ProfileRunResult{
