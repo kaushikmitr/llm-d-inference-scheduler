@@ -163,6 +163,7 @@ func TestInFlightLoadProducer_ConcurrencyStress(t *testing.T) {
 	producer := newTestProducer()
 	ctx := context.Background()
 	endpointName := "stress-endpoint"
+	endpointID := fullEndpointName(endpointName)
 
 	const (
 		numGoroutines = 50
@@ -170,22 +171,8 @@ func TestInFlightLoadProducer_ConcurrencyStress(t *testing.T) {
 	)
 
 	var wg sync.WaitGroup
-	wg.Add(numGoroutines * 2)
+	wg.Add(numGoroutines)
 
-	// Launch increments
-	for i := range numGoroutines {
-		go func(g int) {
-			defer wg.Done()
-			for j := range opsPerRoutine {
-				reqID := fmt.Sprintf("req-%d-%d", g, j)
-				req := &fwksched.InferenceRequest{RequestID: reqID}
-				res := makeSchedulingResult(endpointName)
-				producer.PreRequest(ctx, req, res)
-			}
-		}(i)
-	}
-
-	// Launch decrements
 	for i := range numGoroutines {
 		go func(g int) {
 			defer wg.Done()
@@ -193,12 +180,17 @@ func TestInFlightLoadProducer_ConcurrencyStress(t *testing.T) {
 				reqID := fmt.Sprintf("req-%d-%d", g, j)
 				res := makeSchedulingResult(endpointName)
 				req := &fwksched.InferenceRequest{RequestID: reqID, SchedulingResult: res}
+
+				producer.PreRequest(ctx, req, res)
 				producer.ResponseBody(ctx, req, &requestcontrol.Response{EndOfStream: true}, nil)
 			}
 		}(i)
 	}
 
 	wg.Wait()
+
+	require.Equal(t, int64(0), producer.requestTracker.get(endpointID), "request count drift detected")
+	require.Equal(t, int64(0), producer.tokenTracker.get(endpointID), "token count drift detected")
 }
 
 // --- Helpers ---
