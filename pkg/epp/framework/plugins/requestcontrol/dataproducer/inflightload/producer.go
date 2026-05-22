@@ -333,8 +333,22 @@ func uncachedInputTokens(endpoint fwksched.Endpoint, inputTokens int64) int64 {
 		return nonNeg(inputTokens)
 	}
 
-	matched := int64(info.MatchBlocks()) * int64(info.BlockSizeTokens())
-	return nonNeg(inputTokens - matched)
+	blockSize := int64(info.BlockSizeTokens())
+	matched := int64(info.MatchBlocks()) * blockSize
+	indexed := int64(info.TotalBlocks()) * blockSize
+
+	uncachedIndexed := indexed - matched
+	if uncachedIndexed < 0 {
+		uncachedIndexed = 0
+	}
+
+	// Tail beyond the indexed portion (e.g., when MaxPrefixTokensToMatch caps total).
+	tail := inputTokens - indexed
+	if tail < 0 {
+		tail = 0
+	}
+
+	return uncachedIndexed + tail
 }
 
 func nonNeg(v int64) int64 {

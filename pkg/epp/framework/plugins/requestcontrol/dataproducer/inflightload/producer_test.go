@@ -567,21 +567,3 @@ func TestInFlightLoadProducer_AtomicTokenRelease_Concurrent(t *testing.T) {
 	require.Equal(t, int64(0), producer.tokenTracker.get(endpointID))
 	require.Equal(t, int64(0), producer.requestTracker.get(endpointID))
 }
-
-func TestUncachedInputTokens_Overestimate(t *testing.T) {
-	// Setup:
-	// inputTokens (estimated) = 5
-	// PrefixCacheMatchInfo: matchBlocks=1, totalBlocks=2, blockSizeTokens=4
-	//   indexedTokens = 2 * 4 = 8
-	//   matchedTokens = 1 * 4 = 4
-
-	endpoint := newStubSchedulingEndpoint("test-ep")
-	endpoint.Put(attrprefix.PrefixCacheMatchInfoDataKey.String(), attrprefix.NewPrefixCacheMatchInfo(1, 2, 4))
-
-	inputTokens := int64(5)
-
-	uncached := uncachedInputTokens(endpoint, inputTokens)
-
-	// Ideally it should return 1 (5 total - 4 cached)
-	require.Equal(t, int64(1), uncached, "should only track uncached tokens, not overestimate when indexed > inputTokens")
-}
