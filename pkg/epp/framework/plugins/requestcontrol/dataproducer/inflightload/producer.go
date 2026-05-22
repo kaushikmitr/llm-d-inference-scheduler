@@ -251,6 +251,9 @@ func (p *InFlightLoadProducer) ResponseBody(
 				continue
 			}
 			endpoint := profileResult.TargetEndpoints[0]
+			if endpoint == nil || endpoint.GetMetadata() == nil {
+				continue
+			}
 
 			if !p.addEstimatedOutputTokens {
 				// Tokens are normally freed at StartOfStream; also call
@@ -280,7 +283,7 @@ func (p *InFlightLoadProducer) ResponseBody(
 }
 
 func (p *InFlightLoadProducer) release(endpoint fwksched.Endpoint, request *fwksched.InferenceRequest, profileName string) {
-	if request == nil || request.RequestID == "" || p.PluginState == nil {
+	if endpoint == nil || endpoint.GetMetadata() == nil || request == nil || request.RequestID == "" || p.PluginState == nil {
 		return
 	}
 	eid := endpoint.GetMetadata().NamespacedName.String()
