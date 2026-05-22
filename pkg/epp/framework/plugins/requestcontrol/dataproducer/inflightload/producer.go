@@ -42,46 +42,36 @@ const (
 	profilePrefill           = "prefill"
 )
 
-// Config controls optional behaviors of InFlightLoadProducer.
-type Config struct {
+// InFlightLoadProducerParameters controls optional behaviors of InFlightLoadProducer.
+type InFlightLoadProducerParameters struct {
 	// AddEstimatedOutputTokens controls whether estimated output tokens are added to
 	// the in-flight token counter. Defaults to false.
 	AddEstimatedOutputTokens bool `json:"addEstimatedOutputTokens"`
 }
 
-func defaultConfig() Config {
-	return Config{AddEstimatedOutputTokens: false}
-}
-
-func InFlightLoadProducerFactory(name string, rawParameters json.RawMessage, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
-	cfg := defaultConfig()
-	if len(rawParameters) > 0 {
+func NewInFlightLoadProducer(name string, rawParameters json.RawMessage, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
+	cfg := InFlightLoadProducerParameters{}
+	if rawParameters != nil {
 		if err := json.Unmarshal(rawParameters, &cfg); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal inflight-load-producer parameters: %w", err)
 		}
 	}
-	p := &InFlightLoadProducer{
+	return &InFlightLoadProducer{
 		typedName:                fwkplugin.TypedName{Type: InFlightLoadProducerType, Name: name},
 		requestTracker:           newConcurrencyTracker(),
 		tokenTracker:             newConcurrencyTracker(),
 		tokenEstimator:           NewSimpleTokenEstimator(),
 		addEstimatedOutputTokens: cfg.AddEstimatedOutputTokens,
 		dk:                       attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName(name),
-	}
-	if handle != nil {
-		p.PluginState = fwkplugin.NewPluginState(handle.Context())
-	} else {
-		// Fallback for tests that don't provide a handle.
-		p.PluginState = fwkplugin.NewPluginState(context.Background())
-	}
-	return p, nil
+		PluginState:              fwkplugin.NewPluginState(handle.Context()),
+	}, nil
 }
 
 var (
 	_ requestcontrol.PreRequest            = &InFlightLoadProducer{}
 	_ requestcontrol.ResponseBodyProcessor = &InFlightLoadProducer{}
 	_ requestcontrol.DataProducer          = &InFlightLoadProducer{}
-	_ datalayer.EndpointExtractor          = &InFlightLoadProducer{}
+	_ datalayer.EndpointExtractor          = (*InFlightLoadProducer)(nil)
 	_ datalayer.Registrant                 = &InFlightLoadProducer{}
 )
 
@@ -93,50 +83,36 @@ type InFlightLoadProducer struct {
 	addEstimatedOutputTokens bool
 	PluginState              *fwkplugin.PluginState
 	dk                       fwkplugin.DataKey
-	initOnce                 sync.Once
 }
 
-// initPluginState initializes the per-request plugin state. Idempotent; safe
-// to call from both the factory (eager) and from PreRequest (lazy, for callers
-// that build the struct directly without going through the factory — e.g.
-// unit tests).
-func (p *InFlightLoadProducer) initPluginState(ctx context.Context) {
-	p.initOnce.Do(func() {
-		if p.PluginState == nil {
-			p.PluginState = fwkplugin.NewPluginState(ctx)
-		}
-	})
+// addedTokensEntry tracks a request's contribution to the global token and
+// request counters. OnEvicted rolls back the contribution exactly once,
+// whether triggered by explicit release at end-of-stream or by the janitor's
+// TTL reaper. The token field is atomic so releaseTokensEarly and OnEvicted
+// can race safely: whichever swaps first does the decrement, the other
+// sees 0 and is a no-op.
+type addedTokensEntry struct {
+	endpointID         string
+	tokens             atomic.Int64
+	tokenTracker       *concurrencyTracker
+	requestTracker     *concurrencyTracker
+	requestIncremented bool
 }
 
-// tokenEntry handles rolling back token increments.
-type tokenEntry struct {
-	endpointID   string
-	tokens       int64
-	tokenTracker *concurrencyTracker
-}
+var _ fwkplugin.EvictableStateData = (*addedTokensEntry)(nil)
 
-var _ fwkplugin.EvictableStateData = tokenEntry{}
+// Clone returns the same pointer. These entries hold counter handles, not
+// snapshotable data, and are written exactly once per (request, endpoint,
+// profile) — they are never legitimately cloned.
+func (e *addedTokensEntry) Clone() fwkplugin.StateData { return e }
 
-func (e tokenEntry) Clone() fwkplugin.StateData { return e }
-
-func (e tokenEntry) OnEvicted(_ string, _ fwkplugin.StateKey) {
-	if e.tokens != 0 {
-		e.tokenTracker.add(e.endpointID, -e.tokens)
+func (e *addedTokensEntry) OnEvicted(_ string, _ fwkplugin.StateKey) {
+	if t := e.tokens.Swap(0); t != 0 {
+		e.tokenTracker.add(e.endpointID, -t)
 	}
-}
-
-// requestEntry handles rolling back request increments.
-type requestEntry struct {
-	endpointID     string
-	requestTracker *concurrencyTracker
-}
-
-var _ fwkplugin.EvictableStateData = requestEntry{}
-
-func (e requestEntry) Clone() fwkplugin.StateData { return e }
-
-func (e requestEntry) OnEvicted(_ string, _ fwkplugin.StateKey) {
-	e.requestTracker.dec(e.endpointID)
+	if e.requestIncremented {
+		e.requestTracker.dec(e.endpointID)
+	}
 }
 
 func (p *InFlightLoadProducer) TypedName() fwkplugin.TypedName {
@@ -187,7 +163,6 @@ func (p *InFlightLoadProducer) PreRequest(ctx context.Context, request *fwksched
 	if result == nil || len(result.ProfileResults) == 0 {
 		return
 	}
-	p.initPluginState(ctx)
 
 	inputTokens := p.tokenEstimator.EstimateInput(request)
 
@@ -216,22 +191,17 @@ func (p *InFlightLoadProducer) PreRequest(ctx context.Context, request *fwksched
 
 		p.tokenTracker.add(eid, tokens)
 		if request != nil && request.RequestID != "" && p.PluginState != nil {
+			entry := &addedTokensEntry{
+				endpointID:         eid,
+				tokenTracker:       p.tokenTracker,
+				requestTracker:     p.requestTracker,
+				requestIncremented: true,
+			}
+			entry.tokens.Store(tokens)
 			p.PluginState.Write(
 				request.RequestID,
-				fwkplugin.StateKey(tokenKey(eid, profileName)),
-				tokenEntry{
-					endpointID:   eid,
-					tokens:       tokens,
-					tokenTracker: p.tokenTracker,
-				},
-			)
-			p.PluginState.Write(
-				request.RequestID,
-				fwkplugin.StateKey(requestKey(eid, profileName)),
-				requestEntry{
-					endpointID:     eid,
-					requestTracker: p.requestTracker,
-				},
+				fwkplugin.StateKey(addedTokensKey(eid, profileName)),
+				entry,
 			)
 		}
 	}
@@ -284,7 +254,7 @@ func (p *InFlightLoadProducer) ResponseBody(
 
 			if !p.addEstimatedOutputTokens {
 				// Tokens are normally freed at StartOfStream; also call
-				// releaseTokensEarly here as a safety net for non-streaming or
+				// release here as a safety net for non-streaming or
 				// error paths where StartOfStream may not be observed. It is
 				// a no-op via LoadAndDelete if tokens were already released.
 				p.release(endpoint, request, name)
@@ -310,85 +280,33 @@ func (p *InFlightLoadProducer) ResponseBody(
 }
 
 func (p *InFlightLoadProducer) release(endpoint fwksched.Endpoint, request *fwksched.InferenceRequest, profileName string) {
-	if request != nil && request.RequestID != "" && p.PluginState != nil {
-		eid := endpoint.GetMetadata().NamespacedName.String()
-		tk := fwkplugin.StateKey(tokenKey(eid, profileName))
-		rk := fwkplugin.StateKey(requestKey(eid, profileName))
-
-		// DeleteKey triggers OnEvicted, which decrements the counters exactly once.
-		// If the janitor already reaped the request, these are no-ops.
-		p.PluginState.DeleteKey(request.RequestID, tk)
-		p.PluginState.DeleteKey(request.RequestID, rk)
-		return
-	}
-
-	// Fallback: manually decrement trackers if PluginState wasn't used or entry is missing.
-	p.releaseRequest(endpoint)
-	p.releaseTokens(endpoint, request, profileName)
-}
-
-func (p *InFlightLoadProducer) releaseRequest(endpoint fwksched.Endpoint) {
-	if endpoint == nil || endpoint.GetMetadata() == nil {
+	if request == nil || request.RequestID == "" || p.PluginState == nil {
 		return
 	}
 	eid := endpoint.GetMetadata().NamespacedName.String()
-	p.requestTracker.dec(eid)
+	key := fwkplugin.StateKey(addedTokensKey(eid, profileName))
+
+	// DeleteKey triggers OnEvicted, which decrements the counters exactly once.
+	// If the janitor already reaped the request, these are no-ops.
+	p.PluginState.DeleteKey(request.RequestID, key)
 }
 
 func (p *InFlightLoadProducer) releaseTokensEarly(endpoint fwksched.Endpoint, request *fwksched.InferenceRequest, profileName string) {
-	if endpoint == nil || endpoint.GetMetadata() == nil {
+	if endpoint == nil || endpoint.GetMetadata() == nil || request == nil || request.RequestID == "" || p.PluginState == nil {
 		return
 	}
 	eid := endpoint.GetMetadata().NamespacedName.String()
 
-	if request != nil && request.RequestID != "" && p.PluginState != nil {
-		key := fwkplugin.StateKey(tokenKey(eid, profileName))
-		// DeleteKey fires OnEvicted to decrement tokens; request count stays held by its own entry.
-		p.PluginState.DeleteKey(request.RequestID, key)
-		return
-	}
-
-	// Fallback: manually decrement token tracker only (request count stays held).
-	inputTokens := p.tokenEstimator.EstimateInput(request)
-	tokens := uncachedInputTokens(endpoint, inputTokens)
-	if p.addEstimatedOutputTokens {
-		tokens += p.tokenEstimator.EstimateOutput(inputTokens)
-	}
-	if tokens != 0 {
-		p.tokenTracker.add(eid, -tokens)
+	key := fwkplugin.StateKey(addedTokensKey(eid, profileName))
+	if entry, err := fwkplugin.ReadPluginStateKey[*addedTokensEntry](p.PluginState, request.RequestID, key); err == nil {
+		if t := entry.tokens.Swap(0); t != 0 {
+			entry.tokenTracker.add(entry.endpointID, -t)
+		}
 	}
 }
 
-func (p *InFlightLoadProducer) releaseTokens(endpoint fwksched.Endpoint, request *fwksched.InferenceRequest, profileName string) {
-	if endpoint == nil || endpoint.GetMetadata() == nil {
-		return
-	}
-	eid := endpoint.GetMetadata().NamespacedName.String()
-
-	if request != nil && request.RequestID != "" && p.PluginState != nil {
-		key := fwkplugin.StateKey(tokenKey(eid, profileName))
-		p.PluginState.DeleteKey(request.RequestID, key)
-		return
-	}
-
-	// Fallback: re-estimate. Covers tests/legacy paths that bypass PreRequest
-	// (request is nil or has no RequestID, so nothing was stored to release).
-	inputTokens := p.tokenEstimator.EstimateInput(request)
-	tokens := uncachedInputTokens(endpoint, inputTokens)
-	if p.addEstimatedOutputTokens {
-		tokens += p.tokenEstimator.EstimateOutput(inputTokens)
-	}
-	if tokens != 0 {
-		p.tokenTracker.add(eid, -tokens)
-	}
-}
-
-func tokenKey(endpointID, profileName string) string {
-	return endpointID + "|" + profileName + "|tokens"
-}
-
-func requestKey(endpointID, profileName string) string {
-	return endpointID + "|" + profileName + "|request"
+func addedTokensKey(endpointID, profileName string) string {
+	return endpointID + "|" + profileName + "|added"
 }
 
 // uncachedInputTokens returns the prompt tokens this endpoint must actually compute,
@@ -415,22 +333,8 @@ func uncachedInputTokens(endpoint fwksched.Endpoint, inputTokens int64) int64 {
 		return nonNeg(inputTokens)
 	}
 
-	blockSize := int64(info.BlockSizeTokens())
-	matched := int64(info.MatchBlocks()) * blockSize
-	indexed := int64(info.TotalBlocks()) * blockSize
-
-	uncachedIndexed := indexed - matched
-	if uncachedIndexed < 0 {
-		uncachedIndexed = 0
-	}
-
-	// Tail beyond the indexed portion (e.g., when MaxPrefixTokensToMatch caps total).
-	tail := inputTokens - indexed
-	if tail < 0 {
-		tail = 0
-	}
-
-	return uncachedIndexed + tail
+	matched := int64(info.MatchBlocks()) * int64(info.BlockSizeTokens())
+	return nonNeg(inputTokens - matched)
 }
 
 func nonNeg(v int64) int64 {

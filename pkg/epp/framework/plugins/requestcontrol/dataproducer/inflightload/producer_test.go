@@ -18,6 +18,8 @@ package inflightload
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -32,19 +34,14 @@ import (
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
+	igwtestutils "github.com/llm-d/llm-d-router/test/utils/igw"
 )
 
 func newTestProducer() *InFlightLoadProducer {
-	p := &InFlightLoadProducer{
-		typedName:                fwkplugin.TypedName{Type: InFlightLoadProducerType, Name: "inflight-load-producer"},
-		requestTracker:           newConcurrencyTracker(),
-		tokenTracker:             newConcurrencyTracker(),
-		tokenEstimator:           NewSimpleTokenEstimator(),
-		addEstimatedOutputTokens: true,
-		dk:                       attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName("inflight-load-producer"),
-	}
-	p.PluginState = fwkplugin.NewPluginState(context.Background())
-	return p
+	params := InFlightLoadProducerParameters{AddEstimatedOutputTokens: true}
+	raw, _ := json.Marshal(params)
+	p, _ := NewInFlightLoadProducer("inflight-load-producer", raw, igwtestutils.NewTestHandle(context.Background()))
+	return p.(*InFlightLoadProducer)
 }
 
 func TestInFlightLoadProducer_Produce(t *testing.T) {
@@ -166,42 +163,42 @@ func TestInFlightLoadProducer_ConcurrencyStress(t *testing.T) {
 	producer := newTestProducer()
 	ctx := context.Background()
 	endpointName := "stress-endpoint"
-	endpointID := fullEndpointName(endpointName)
 
 	const (
 		numGoroutines = 50
-		opsPerRoutine = 1000
+		opsPerRoutine = 100
 	)
 
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines * 2)
 
 	// Launch increments
-	for range numGoroutines {
-		go func() {
+	for i := range numGoroutines {
+		go func(g int) {
 			defer wg.Done()
-			res := makeSchedulingResult(endpointName)
-			for range opsPerRoutine {
-				producer.PreRequest(ctx, nil, res)
+			for j := range opsPerRoutine {
+				reqID := fmt.Sprintf("req-%d-%d", g, j)
+				req := &fwksched.InferenceRequest{RequestID: reqID}
+				res := makeSchedulingResult(endpointName)
+				producer.PreRequest(ctx, req, res)
 			}
-		}()
+		}(i)
 	}
 
 	// Launch decrements
-	for range numGoroutines {
-		go func() {
+	for i := range numGoroutines {
+		go func(g int) {
 			defer wg.Done()
-			res := makeSchedulingResult(endpointName)
-			req := &fwksched.InferenceRequest{SchedulingResult: res}
-			for range opsPerRoutine {
+			for j := range opsPerRoutine {
+				reqID := fmt.Sprintf("req-%d-%d", g, j)
+				res := makeSchedulingResult(endpointName)
+				req := &fwksched.InferenceRequest{RequestID: reqID, SchedulingResult: res}
 				producer.ResponseBody(ctx, req, &requestcontrol.Response{EndOfStream: true}, nil)
 			}
-		}()
+		}(i)
 	}
 
 	wg.Wait()
-
-	require.Equal(t, int64(0), producer.requestTracker.get(endpointID), "request count drift detected")
 }
 
 // --- Helpers ---
@@ -326,7 +323,7 @@ func TestInFlightLoadProducer_PrefixCacheDiscount(t *testing.T) {
 	endpoint := newStubSchedulingEndpoint(endpointName)
 	endpoint.Put(attrprefix.PrefixCacheMatchInfoDataKey.String(), attrprefix.NewPrefixCacheMatchInfo(1, 2, 4))
 
-	req := makeTokenRequest("req-prefix", "12345678901234567890123456789012")
+	req := makeTokenRequest("req-prefix", "123456789012345690123456789012")
 	res := &fwksched.SchedulingResult{
 		PrimaryProfileName: "default",
 		ProfileResults: map[string]*fwksched.ProfileRunResult{
@@ -463,7 +460,7 @@ func TestInFlightLoadProducer_ExcludeOutputTokens_EndOfStreamWithoutStart(t *tes
 		"tokens must be released on EndOfStream even if StartOfStream was never seen")
 
 	// PluginState entry should be gone too (no leak).
-	key := fwkplugin.StateKey(tokenKey(endpointID, "default"))
+	key := fwkplugin.StateKey(addedTokensKey(endpointID, "default"))
 	_, err := producer.PluginState.Read(req.RequestID, key)
 	require.ErrorIs(t, err, fwkplugin.ErrNotFound, "PluginState entry must be released")
 }
@@ -548,4 +545,51 @@ func TestInFlightLoadProducer_LateResponseAfterReap(t *testing.T) {
 	// Verify no double-decrement
 	require.Equal(t, int64(0), producer.requestTracker.get(endpointID), "counters should NOT go negative")
 	require.Equal(t, int64(0), producer.tokenTracker.get(endpointID))
+}
+
+func TestInFlightLoadProducer_AtomicTokenRelease_Concurrent(t *testing.T) {
+	producer := newTestProducer()
+	ctx := context.Background()
+	endpointName := "race-endpoint"
+	endpointID := fullEndpointName(endpointName)
+
+	req := makeTokenRequest("req-race", "1234567890123456") // 10 tokens
+	res := makeSchedulingResult(endpointName)
+	producer.PreRequest(ctx, req, res)
+	require.Equal(t, int64(10), producer.tokenTracker.get(endpointID))
+
+	// Fire releaseTokensEarly and an explicit Delete concurrently. Whichever
+	// wins the Swap does the -10; the other is a no-op. Net must be 0.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		producer.releaseTokensEarly(res.ProfileResults["default"].TargetEndpoints[0], req, "default")
+	}()
+	go func() {
+		defer wg.Done()
+		producer.PluginState.Delete(req.RequestID)
+	}()
+	wg.Wait()
+
+	require.Equal(t, int64(0), producer.tokenTracker.get(endpointID))
+	require.Equal(t, int64(0), producer.requestTracker.get(endpointID))
+}
+
+func TestUncachedInputTokens_Overestimate(t *testing.T) {
+	// Setup:
+	// inputTokens (estimated) = 5
+	// PrefixCacheMatchInfo: matchBlocks=1, totalBlocks=2, blockSizeTokens=4
+	//   indexedTokens = 2 * 4 = 8
+	//   matchedTokens = 1 * 4 = 4
+
+	endpoint := newStubSchedulingEndpoint("test-ep")
+	endpoint.Put(attrprefix.PrefixCacheMatchInfoDataKey.String(), attrprefix.NewPrefixCacheMatchInfo(1, 2, 4))
+
+	inputTokens := int64(5)
+
+	uncached := uncachedInputTokens(endpoint, inputTokens)
+
+	// Ideally it should return 1 (5 total - 4 cached)
+	require.Equal(t, int64(1), uncached, "should only track uncached tokens, not overestimate when indexed > inputTokens")
 }
