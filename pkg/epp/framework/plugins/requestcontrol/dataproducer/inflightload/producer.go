@@ -49,7 +49,7 @@ type InFlightLoadProducerParameters struct {
 	AddEstimatedOutputTokens bool `json:"addEstimatedOutputTokens"`
 }
 
-func NewInFlightLoadProducer(name string, rawParameters json.RawMessage, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
+func InFlightLoadProducerFactory(name string, rawParameters json.RawMessage, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
 	cfg := InFlightLoadProducerParameters{}
 	if rawParameters != nil {
 		if err := json.Unmarshal(rawParameters, &cfg); err != nil {
