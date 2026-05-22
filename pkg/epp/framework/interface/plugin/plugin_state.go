@@ -75,6 +75,7 @@ func (s *PluginState) Read(requestID string, key StateKey) (StateData, error) {
 }
 
 // Write stores the given "val" in PluginState with the given "key" in the context of the given "requestID".
+// Note: overwriting an existing key does NOT trigger OnEvicted on the displaced value.
 func (s *PluginState) Write(requestID string, key StateKey, val StateData) {
 	s.requestToLastAccessTime.Store(requestID, time.Now())
 	var stateData *sync.Map
@@ -94,6 +95,8 @@ func (s *PluginState) Write(requestID string, key StateKey, val StateData) {
 // It is possible to call Delete explicitly when the handling of a request is completed
 // or alternatively, if the request failed during its processing, a cleanup goroutine will
 // clean data of stale requests.
+//
+// Note: Delete triggers the OnEvicted callback for every EvictableStateData entry being removed.
 func (s *PluginState) Delete(requestID string) {
 	if val, ok := s.storage.LoadAndDelete(requestID); ok {
 		s.requestToLastAccessTime.Delete(requestID)
@@ -109,6 +112,8 @@ func (s *PluginState) Delete(requestID string) {
 }
 
 // DeleteKey deletes the data associated with the given "key" in the context of "requestID" from PluginState.
+//
+// Note: DeleteKey triggers the OnEvicted callback for the EvictableStateData entry being removed.
 func (s *PluginState) DeleteKey(requestID string, key StateKey) {
 	stateMap, ok := s.storage.Load(requestID)
 	if !ok {
@@ -127,6 +132,15 @@ func (s *PluginState) DeleteKey(requestID string, key StateKey) {
 // lifetime before being reaped by the janitor.
 func (s *PluginState) Touch(requestID string) {
 	s.requestToLastAccessTime.Store(requestID, time.Now())
+}
+
+// LastAccessTime returns the last access time for the given requestID and a
+// boolean indicating if the requestID was found.
+func (s *PluginState) LastAccessTime(requestID string) (time.Time, bool) {
+	if val, ok := s.requestToLastAccessTime.Load(requestID); ok {
+		return val.(time.Time), true
+	}
+	return time.Time{}, false
 }
 
 // cleanup periodically deletes data associated with the given requestID.
@@ -152,6 +166,7 @@ func (s *PluginState) cleanStaleRequests() {
 		requestID := k.(string)
 		lastAccessTime := v.(time.Time)
 		if time.Since(lastAccessTime) > stalenessThreshold {
+			log.Log.V(logutil.DEBUG).Info("Cleaning up stale request from PluginState", "requestID", requestID, "lastAccessTime", lastAccessTime)
 			s.Delete(requestID) // cleanup stale requests (this is safe in sync.Map)
 		}
 		return true

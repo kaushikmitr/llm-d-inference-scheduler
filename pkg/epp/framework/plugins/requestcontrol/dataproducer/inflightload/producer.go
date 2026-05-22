@@ -108,32 +108,35 @@ func (p *InFlightLoadProducer) initPluginState(ctx context.Context) {
 	})
 }
 
-// addedTokensEntry is the value stored in pluginState; it carries the endpoint
-// the increment was charged to so the cleanup can roll it back.
-type addedTokensEntry struct {
-	endpointID         string
-	tokens             int64
-	tokenTracker       *concurrencyTracker
-	requestTracker     *concurrencyTracker
-	requestIncremented bool
+// tokenEntry handles rolling back token increments.
+type tokenEntry struct {
+	endpointID   string
+	tokens       int64
+	tokenTracker *concurrencyTracker
 }
 
-var _ fwkplugin.EvictableStateData = addedTokensEntry{}
+var _ fwkplugin.EvictableStateData = tokenEntry{}
 
-// Clone implements fwkplugin.StateData.
-func (e addedTokensEntry) Clone() fwkplugin.StateData {
-	return e
-}
+func (e tokenEntry) Clone() fwkplugin.StateData { return e }
 
-// OnEvicted implements fwkplugin.EvictableStateData to automatically rollback
-// counters when the entry is deleted or expires.
-func (e addedTokensEntry) OnEvicted(_ string, _ fwkplugin.StateKey) {
+func (e tokenEntry) OnEvicted(_ string, _ fwkplugin.StateKey) {
 	if e.tokens != 0 {
 		e.tokenTracker.add(e.endpointID, -e.tokens)
 	}
-	if e.requestIncremented {
-		e.requestTracker.dec(e.endpointID)
-	}
+}
+
+// requestEntry handles rolling back request increments.
+type requestEntry struct {
+	endpointID     string
+	requestTracker *concurrencyTracker
+}
+
+var _ fwkplugin.EvictableStateData = requestEntry{}
+
+func (e requestEntry) Clone() fwkplugin.StateData { return e }
+
+func (e requestEntry) OnEvicted(_ string, _ fwkplugin.StateKey) {
+	e.requestTracker.dec(e.endpointID)
 }
 
 func (p *InFlightLoadProducer) TypedName() fwkplugin.TypedName {
@@ -215,13 +218,19 @@ func (p *InFlightLoadProducer) PreRequest(ctx context.Context, request *fwksched
 		if request != nil && request.RequestID != "" && p.PluginState != nil {
 			p.PluginState.Write(
 				request.RequestID,
-				fwkplugin.StateKey(addedTokensKey(eid, profileName)),
-				addedTokensEntry{
-					endpointID:         eid,
-					tokens:             tokens,
-					tokenTracker:       p.tokenTracker,
-					requestTracker:     p.requestTracker,
-					requestIncremented: true,
+				fwkplugin.StateKey(tokenKey(eid, profileName)),
+				tokenEntry{
+					endpointID:   eid,
+					tokens:       tokens,
+					tokenTracker: p.tokenTracker,
+				},
+			)
+			p.PluginState.Write(
+				request.RequestID,
+				fwkplugin.StateKey(requestKey(eid, profileName)),
+				requestEntry{
+					endpointID:     eid,
+					requestTracker: p.requestTracker,
 				},
 			)
 		}
@@ -293,24 +302,24 @@ func (p *InFlightLoadProducer) ResponseBody(
 		if request.RequestID != "" && p.PluginState != nil {
 			p.PluginState.Delete(request.RequestID)
 		}
-	} else {
+	} else if request.RequestID != "" && p.PluginState != nil {
 		// Intermediate chunk: touch the request state to extend its lifetime
 		// before being reaped by the janitor.
-		if request.RequestID != "" && p.PluginState != nil {
-			p.PluginState.Touch(request.RequestID)
-		}
+		p.PluginState.Touch(request.RequestID)
 	}
 }
 
 func (p *InFlightLoadProducer) release(endpoint fwksched.Endpoint, request *fwksched.InferenceRequest, profileName string) {
-	// Prefer the exact value stored in PreRequest to keep counters balanced.
-	// Calling DeleteKey will trigger OnEvicted, which decrements both trackers.
 	if request != nil && request.RequestID != "" && p.PluginState != nil {
-		key := fwkplugin.StateKey(addedTokensKey(endpoint.GetMetadata().NamespacedName.String(), profileName))
-		if _, err := p.PluginState.Read(request.RequestID, key); err == nil {
-			p.PluginState.DeleteKey(request.RequestID, key)
-			return
-		}
+		eid := endpoint.GetMetadata().NamespacedName.String()
+		tk := fwkplugin.StateKey(tokenKey(eid, profileName))
+		rk := fwkplugin.StateKey(requestKey(eid, profileName))
+
+		// DeleteKey triggers OnEvicted, which decrements the counters exactly once.
+		// If the janitor already reaped the request, these are no-ops.
+		p.PluginState.DeleteKey(request.RequestID, tk)
+		p.PluginState.DeleteKey(request.RequestID, rk)
+		return
 	}
 
 	// Fallback: manually decrement trackers if PluginState wasn't used or entry is missing.
@@ -333,15 +342,9 @@ func (p *InFlightLoadProducer) releaseTokensEarly(endpoint fwksched.Endpoint, re
 	eid := endpoint.GetMetadata().NamespacedName.String()
 
 	if request != nil && request.RequestID != "" && p.PluginState != nil {
-		key := fwkplugin.StateKey(addedTokensKey(eid, profileName))
-		if entry, err := fwkplugin.ReadPluginStateKey[addedTokensEntry](p.PluginState, request.RequestID, key); err == nil {
-			if entry.tokens != 0 {
-				p.tokenTracker.add(eid, -entry.tokens)
-				entry.tokens = 0
-				p.PluginState.Write(request.RequestID, key, entry)
-			}
-			return
-		}
+		key := fwkplugin.StateKey(tokenKey(eid, profileName))
+		// DeleteKey fires OnEvicted to decrement tokens; request count stays held by its own entry.
+		p.PluginState.DeleteKey(request.RequestID, key)
 		return
 	}
 
@@ -362,16 +365,9 @@ func (p *InFlightLoadProducer) releaseTokens(endpoint fwksched.Endpoint, request
 	}
 	eid := endpoint.GetMetadata().NamespacedName.String()
 
-	// Prefer the exact value stored in PreRequest to keep counters balanced.
 	if request != nil && request.RequestID != "" && p.PluginState != nil {
-		key := fwkplugin.StateKey(addedTokensKey(eid, profileName))
-		if _, err := fwkplugin.ReadPluginStateKey[addedTokensEntry](p.PluginState, request.RequestID, key); err == nil {
-			p.PluginState.DeleteKey(request.RequestID, key)
-			// tokens are decremented via OnEvicted
-			return
-		}
-		// Either we just released the stored value, or the key was already
-		// released by a previous call — both cases are no-ops.
+		key := fwkplugin.StateKey(tokenKey(eid, profileName))
+		p.PluginState.DeleteKey(request.RequestID, key)
 		return
 	}
 
@@ -387,8 +383,12 @@ func (p *InFlightLoadProducer) releaseTokens(endpoint fwksched.Endpoint, request
 	}
 }
 
-func addedTokensKey(endpointID, profileName string) string {
-	return endpointID + "|" + profileName
+func tokenKey(endpointID, profileName string) string {
+	return endpointID + "|" + profileName + "|tokens"
+}
+
+func requestKey(endpointID, profileName string) string {
+	return endpointID + "|" + profileName + "|request"
 }
 
 // uncachedInputTokens returns the prompt tokens this endpoint must actually compute,

@@ -20,6 +20,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/types"
@@ -462,7 +463,7 @@ func TestInFlightLoadProducer_ExcludeOutputTokens_EndOfStreamWithoutStart(t *tes
 		"tokens must be released on EndOfStream even if StartOfStream was never seen")
 
 	// PluginState entry should be gone too (no leak).
-	key := fwkplugin.StateKey(addedTokensKey(endpointID, "default"))
+	key := fwkplugin.StateKey(tokenKey(endpointID, "default"))
 	_, err := producer.PluginState.Read(req.RequestID, key)
 	require.ErrorIs(t, err, fwkplugin.ErrNotFound, "PluginState entry must be released")
 }
@@ -500,20 +501,51 @@ func TestInFlightLoadProducer_Touch(t *testing.T) {
 	ctx := context.Background()
 	endpointName := "touch-endpoint"
 
-	req := makeTokenRequest("req-touch", "1234")
+	req := makeTokenRequest("req-touch", "1234567890123456")
 	res := makeSchedulingResult(endpointName)
 	producer.PreRequest(ctx, req, res)
 
-	// Verify we can find the state
-	key := fwkplugin.StateKey(addedTokensKey(fullEndpointName(endpointName), "default"))
-	_, err := producer.PluginState.Read(req.RequestID, key)
-	require.NoError(t, err)
+	// Get initial access time
+	t1, ok := producer.PluginState.LastAccessTime(req.RequestID)
+	require.True(t, ok)
+
+	// Sleep briefly to ensure time moves forward
+	time.Sleep(2 * time.Millisecond)
 
 	// Simulate an intermediate chunk
 	req.SchedulingResult = res
 	producer.ResponseBody(ctx, req, &requestcontrol.Response{EndOfStream: false, StartOfStream: false}, nil)
 
-	// Since we can't easily peek at private requestToLastAccessTime in PluginState
-	// without reflection or export, we rely on the implementation calling Touch().
-	// We already tested Touch() unit-wise in plugin_state_test.go.
+	// Verify access time was updated
+	t2, ok := producer.PluginState.LastAccessTime(req.RequestID)
+	require.True(t, ok)
+	require.True(t, t2.After(t1), "Touch should have extended the lifetime")
+}
+
+// TestInFlightLoadProducer_LateResponseAfterReap verifies that if a ResponseBody
+// arrives after the janitor has already reaped the request, we do NOT double-decrement.
+func TestInFlightLoadProducer_LateResponseAfterReap(t *testing.T) {
+	producer := newTestProducer()
+	ctx := context.Background()
+	endpointName := "late-endpoint"
+	endpointID := fullEndpointName(endpointName)
+
+	req := makeTokenRequest("req-late", "1234567890123456") // 10 tokens
+	res := makeSchedulingResult(endpointName)
+	producer.PreRequest(ctx, req, res)
+
+	require.Equal(t, int64(1), producer.requestTracker.get(endpointID))
+	require.Equal(t, int64(10), producer.tokenTracker.get(endpointID))
+
+	// Simulate janitor reap
+	producer.PluginState.Delete(req.RequestID)
+	require.Equal(t, int64(0), producer.requestTracker.get(endpointID), "counters should be 0 after reap")
+
+	// Late ResponseBody arrives
+	req.SchedulingResult = res
+	producer.ResponseBody(ctx, req, &requestcontrol.Response{EndOfStream: true}, nil)
+
+	// Verify no double-decrement
+	require.Equal(t, int64(0), producer.requestTracker.get(endpointID), "counters should NOT go negative")
+	require.Equal(t, int64(0), producer.tokenTracker.get(endpointID))
 }
