@@ -582,6 +582,7 @@ func TestUncachedInputTokens_Overestimate(t *testing.T) {
 
 	uncached := uncachedInputTokens(endpoint, inputTokens)
 
-	// Ideally it should return 1 (5 total - 4 cached)
-	require.Equal(t, int64(1), uncached, "should only track uncached tokens, not overestimate when indexed > inputTokens")
+	// When the prefix cache says 4 tokens are definitely uncached in the indexed portion (8-4),
+	// we trust that over the smaller (approximate) estimate of 5.
+	require.Equal(t, int64(4), uncached, "should trust the prefix cache's uncached count (indexed-matched) over the smaller estimate")
 }
