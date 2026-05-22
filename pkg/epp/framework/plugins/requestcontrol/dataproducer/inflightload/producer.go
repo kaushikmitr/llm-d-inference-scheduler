@@ -88,15 +88,15 @@ type InFlightLoadProducer struct {
 // addedTokensEntry tracks a request's contribution to the global token and
 // request counters. OnEvicted rolls back the contribution exactly once,
 // whether triggered by explicit release at end-of-stream or by the janitor's
-// TTL reaper. The token field is atomic so releaseTokensEarly and OnEvicted
+// TTL reaper. The fields are atomic so releaseTokensEarly and OnEvicted
 // can race safely: whichever swaps first does the decrement, the other
 // sees 0 and is a no-op.
 type addedTokensEntry struct {
-	endpointID         string
-	tokens             atomic.Int64
-	tokenTracker       *concurrencyTracker
-	requestTracker     *concurrencyTracker
-	requestIncremented bool
+	endpointID     string
+	tokens         atomic.Int64
+	tokenTracker   *concurrencyTracker
+	requestTracker *concurrencyTracker
+	requests       atomic.Int32
 }
 
 var _ fwkplugin.EvictableStateData = (*addedTokensEntry)(nil)
@@ -110,7 +110,7 @@ func (e *addedTokensEntry) OnEvicted(_ string, _ fwkplugin.StateKey) {
 	if t := e.tokens.Swap(0); t != 0 {
 		e.tokenTracker.add(e.endpointID, -t)
 	}
-	if e.requestIncremented {
+	if e.requests.Swap(0) != 0 {
 		e.requestTracker.dec(e.endpointID)
 	}
 }
@@ -192,12 +192,12 @@ func (p *InFlightLoadProducer) PreRequest(ctx context.Context, request *fwksched
 		p.tokenTracker.add(eid, tokens)
 		if request != nil && request.RequestID != "" && p.PluginState != nil {
 			entry := &addedTokensEntry{
-				endpointID:         eid,
-				tokenTracker:       p.tokenTracker,
-				requestTracker:     p.requestTracker,
-				requestIncremented: true,
+				endpointID:     eid,
+				tokenTracker:   p.tokenTracker,
+				requestTracker: p.requestTracker,
 			}
 			entry.tokens.Store(tokens)
+			entry.requests.Store(1)
 			p.PluginState.Write(
 				request.RequestID,
 				fwkplugin.StateKey(addedTokensKey(eid, profileName)),
