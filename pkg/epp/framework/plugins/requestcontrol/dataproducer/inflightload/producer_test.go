@@ -37,17 +37,19 @@ import (
 	igwtestutils "github.com/llm-d/llm-d-router/test/utils/igw"
 )
 
-func newTestProducer() *InFlightLoadProducer {
+func newTestProducer(t testing.TB) *InFlightLoadProducer {
 	params := InFlightLoadProducerParameters{AddEstimatedOutputTokens: true}
-	raw, _ := json.Marshal(params)
-	p, _ := InFlightLoadProducerFactory("inflight-load-producer", raw, igwtestutils.NewTestHandle(context.Background()))
+	raw, err := json.Marshal(params)
+	require.NoError(t, err)
+	p, err := InFlightLoadProducerFactory("inflight-load-producer", raw, igwtestutils.NewTestHandle(context.Background()))
+	require.NoError(t, err)
 	return p.(*InFlightLoadProducer)
 }
 
 func TestInFlightLoadProducer_Produce(t *testing.T) {
 	t.Parallel()
 
-	producer := newTestProducer()
+	producer := newTestProducer(t)
 
 	endpointName := "test-endpoint"
 	endpointID := fullEndpointName(endpointName)
@@ -74,7 +76,7 @@ func TestInFlightLoadProducer_Produce(t *testing.T) {
 func TestInFlightLoadProducer_Lifecycle(t *testing.T) {
 	t.Parallel()
 
-	producer := newTestProducer()
+	producer := newTestProducer(t)
 	ctx := context.Background()
 	endpointName := "lifecycle-endpoint"
 	endpointID := fullEndpointName(endpointName)
@@ -98,7 +100,7 @@ func TestInFlightLoadProducer_Lifecycle(t *testing.T) {
 func TestInFlightLoadProducer_MultiPodLifecycle(t *testing.T) {
 	t.Parallel()
 
-	producer := newTestProducer()
+	producer := newTestProducer(t)
 	ctx := context.Background()
 	podA := "pod-a"
 	podB := "pod-b"
@@ -134,7 +136,7 @@ func TestInFlightLoadProducer_MultiPodLifecycle(t *testing.T) {
 func TestInFlightLoadProducer_NotificationCleanup(t *testing.T) {
 	t.Parallel()
 
-	producer := newTestProducer()
+	producer := newTestProducer(t)
 	ctx := context.Background()
 	endpointName := "deleted-endpoint"
 	endpointID := fullEndpointName(endpointName)
@@ -160,7 +162,7 @@ func TestInFlightLoadProducer_NotificationCleanup(t *testing.T) {
 func TestInFlightLoadProducer_ConcurrencyStress(t *testing.T) {
 	t.Parallel()
 
-	producer := newTestProducer()
+	producer := newTestProducer(t)
 	ctx := context.Background()
 	endpointName := "stress-endpoint"
 	endpointID := fullEndpointName(endpointName)
@@ -250,7 +252,7 @@ func makeTokenRequest(requestID, prompt string) *fwksched.InferenceRequest {
 func TestInFlightLoadProducer_ExcludeOutputTokens_StartOfStreamRelease(t *testing.T) {
 	t.Parallel()
 
-	producer := newTestProducer()
+	producer := newTestProducer(t)
 	producer.addEstimatedOutputTokens = false
 	ctx := context.Background()
 	endpointName := "exclude-output-endpoint"
@@ -280,7 +282,7 @@ func TestInFlightLoadProducer_ExcludeOutputTokens_StartOfStreamRelease(t *testin
 func TestInFlightLoadProducer_ExcludeOutputTokens_SingleChunk(t *testing.T) {
 	t.Parallel()
 
-	producer := newTestProducer()
+	producer := newTestProducer(t)
 	producer.addEstimatedOutputTokens = false
 	ctx := context.Background()
 	endpointName := "single-chunk-endpoint"
@@ -303,7 +305,7 @@ func TestInFlightLoadProducer_ExcludeOutputTokens_SingleChunk(t *testing.T) {
 func TestInFlightLoadProducer_PrefixCacheDiscount(t *testing.T) {
 	t.Parallel()
 
-	producer := newTestProducer()
+	producer := newTestProducer(t)
 	ctx := context.Background()
 	endpointName := "prefix-cache-endpoint"
 	endpointID := fullEndpointName(endpointName)
@@ -342,7 +344,7 @@ func TestInFlightLoadProducer_PrefixCacheDiscount(t *testing.T) {
 func TestInFlightLoadProducer_PrefixCacheDiscount_PerEndpoint(t *testing.T) {
 	t.Parallel()
 
-	producer := newTestProducer()
+	producer := newTestProducer(t)
 	ctx := context.Background()
 	podA := "pod-a-cached"
 	podB := "pod-b-uncached"
@@ -385,7 +387,7 @@ func TestInFlightLoadProducer_PrefixCacheDiscount_PerEndpoint(t *testing.T) {
 func TestInFlightLoadProducer_BalancedAddRelease_MultipleProfilesSameEndpoint(t *testing.T) {
 	t.Parallel()
 
-	producer := newTestProducer()
+	producer := newTestProducer(t)
 	ctx := context.Background()
 	endpointName := "shared-endpoint"
 	endpointID := fullEndpointName(endpointName)
@@ -426,7 +428,7 @@ func TestInFlightLoadProducer_BalancedAddRelease_MultipleProfilesSameEndpoint(t 
 func TestInFlightLoadProducer_ExcludeOutputTokens_EndOfStreamWithoutStart(t *testing.T) {
 	t.Parallel()
 
-	producer := newTestProducer()
+	producer := newTestProducer(t)
 	producer.addEstimatedOutputTokens = false
 	ctx := context.Background()
 	endpointName := "no-start-endpoint"
@@ -460,7 +462,7 @@ func TestInFlightLoadProducer_ExcludeOutputTokens_EndOfStreamWithoutStart(t *tes
 // TestInFlightLoadProducer_TTL verifies that global counters are rolled back
 // when the background janitor reaps an abandoned request from PluginState.
 func TestInFlightLoadProducer_TTL(t *testing.T) {
-	producer := newTestProducer()
+	producer := newTestProducer(t)
 	ctx := context.Background()
 	endpointName := "abandoned-endpoint"
 	endpointID := fullEndpointName(endpointName)
@@ -486,7 +488,7 @@ func TestInFlightLoadProducer_TTL(t *testing.T) {
 // TestInFlightLoadProducer_Touch verifies that intermediate chunks extend the
 // request's lifetime in PluginState.
 func TestInFlightLoadProducer_Touch(t *testing.T) {
-	producer := newTestProducer()
+	producer := newTestProducer(t)
 	ctx := context.Background()
 	endpointName := "touch-endpoint"
 
@@ -514,7 +516,7 @@ func TestInFlightLoadProducer_Touch(t *testing.T) {
 // TestInFlightLoadProducer_LateResponseAfterReap verifies that if a ResponseBody
 // arrives after the janitor has already reaped the request, we do NOT double-decrement.
 func TestInFlightLoadProducer_LateResponseAfterReap(t *testing.T) {
-	producer := newTestProducer()
+	producer := newTestProducer(t)
 	ctx := context.Background()
 	endpointName := "late-endpoint"
 	endpointID := fullEndpointName(endpointName)
@@ -540,7 +542,7 @@ func TestInFlightLoadProducer_LateResponseAfterReap(t *testing.T) {
 }
 
 func TestInFlightLoadProducer_AtomicTokenRelease_Concurrent(t *testing.T) {
-	producer := newTestProducer()
+	producer := newTestProducer(t)
 	ctx := context.Background()
 	endpointName := "race-endpoint"
 	endpointID := fullEndpointName(endpointName)
