@@ -60,11 +60,11 @@ type PluginState struct {
 // Read retrieves data with the given "key" in the context of "requestID" from PluginState.
 // If the key is not present, ErrNotFound is returned.
 func (s *PluginState) Read(requestID string, key StateKey) (StateData, error) {
-	s.requestToLastAccessTime.Store(requestID, time.Now())
 	stateMap, ok := s.storage.Load(requestID)
 	if !ok {
 		return nil, ErrNotFound
 	}
+	s.requestToLastAccessTime.Store(requestID, time.Now())
 
 	stateData := stateMap.(*sync.Map)
 	if value, ok := stateData.Load(key); ok {
@@ -98,9 +98,8 @@ func (s *PluginState) Write(requestID string, key StateKey, val StateData) {
 //
 // Note: Delete triggers the OnEvicted callback for every EvictableStateData entry being removed.
 func (s *PluginState) Delete(requestID string) {
+	s.requestToLastAccessTime.Delete(requestID)
 	if val, ok := s.storage.LoadAndDelete(requestID); ok {
-		s.requestToLastAccessTime.Delete(requestID)
-
 		stateData := val.(*sync.Map)
 		stateData.Range(func(k, v any) bool {
 			if evictable, ok := v.(EvictableStateData); ok {
