@@ -40,7 +40,7 @@ import (
 func newTestProducer() *InFlightLoadProducer {
 	params := InFlightLoadProducerParameters{AddEstimatedOutputTokens: true}
 	raw, _ := json.Marshal(params)
-	p, _ := InFlightLoadProducerFactory("inflight-load-producer", raw, igwtestutils.NewTestHandle(context.Background()))
+	p, _ := NewInFlightLoadProducer("inflight-load-producer", raw, igwtestutils.NewTestHandle(context.Background()))
 	return p.(*InFlightLoadProducer)
 }
 

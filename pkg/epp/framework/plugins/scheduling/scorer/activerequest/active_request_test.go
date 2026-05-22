@@ -95,7 +95,7 @@ func TestActiveRequestScorer_Score(t *testing.T) {
 func TestActiveRequestScorer_UsesInFlightLoadProducerLifecycle(t *testing.T) {
 	ctx := utils.NewTestContext(t)
 
-	producerPlugin, err := inflightload.InFlightLoadProducerFactory(inflightload.InFlightLoadProducerType, nil, igwtestutils.NewTestHandle(ctx))
+	producerPlugin, err := inflightload.NewInFlightLoadProducer(inflightload.InFlightLoadProducerType, nil, igwtestutils.NewTestHandle(ctx))
 	require.NoError(t, err)
 	producer := producerPlugin.(*inflightload.InFlightLoadProducer)
 	scorer := NewActiveRequest(ctx, nil)
