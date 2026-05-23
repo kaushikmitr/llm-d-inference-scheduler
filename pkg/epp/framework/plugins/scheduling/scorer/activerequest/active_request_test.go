@@ -63,7 +63,7 @@ func TestActiveRequestScorer_Score(t *testing.T) {
 			want: []float64{0.5, 1.0, 0.0},
 		},
 		{
-			name: "some endpoints have load data",
+			name: "all endpoints have load data",
 			endpoints: func() []scheduling.Endpoint {
 				return []scheduling.Endpoint{
 					newTestEndpointWithLoad("pod-a", 4),
