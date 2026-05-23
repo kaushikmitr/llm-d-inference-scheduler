@@ -41,7 +41,9 @@ func newTestProducer(t testing.TB) *InFlightLoadProducer {
 	params := InFlightLoadProducerParameters{AddEstimatedOutputTokens: true}
 	raw, err := json.Marshal(params)
 	require.NoError(t, err)
-	p, err := InFlightLoadProducerFactory("inflight-load-producer", raw, igwtestutils.NewTestHandle(context.Background()))
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	p, err := InFlightLoadProducerFactory("inflight-load-producer", raw, igwtestutils.NewTestHandle(ctx))
 	require.NoError(t, err)
 	return p.(*InFlightLoadProducer)
 }

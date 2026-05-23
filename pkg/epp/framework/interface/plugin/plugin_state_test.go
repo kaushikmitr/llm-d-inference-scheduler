@@ -53,7 +53,8 @@ func (d *evictableTestData) OnEvicted(requestID string, key StateKey) {
 
 // TestPluginState_EvictionCallback verifies that OnEvicted is called when data is removed.
 func TestPluginState_EvictionCallback(t *testing.T) {
-	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+	ctx, cancel := context.WithCancel(logutil.NewTestLoggerIntoContext(context.Background()))
+	t.Cleanup(cancel)
 	state := NewPluginState(ctx)
 
 	requestID := "req-evict"
@@ -89,7 +90,8 @@ func TestPluginState_EvictionCallback(t *testing.T) {
 
 // TestPluginState_Touch verifies that Touch extends request lifetime.
 func TestPluginState_Touch(t *testing.T) {
-	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+	ctx, cancel := context.WithCancel(logutil.NewTestLoggerIntoContext(context.Background()))
+	t.Cleanup(cancel)
 	state := NewPluginState(ctx)
 
 	requestID := "req-touch"
@@ -123,7 +125,8 @@ func TestPluginState_Touch(t *testing.T) {
 // - Reading the data back
 // - Deleting the data and confirming it's removed
 func TestPluginState_ReadWrite(t *testing.T) {
-	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+	ctx, cancel := context.WithCancel(logutil.NewTestLoggerIntoContext(context.Background()))
+	t.Cleanup(cancel)
 
 	state := NewPluginState(ctx)
 
@@ -169,7 +172,8 @@ func TestPluginState_ReadWrite(t *testing.T) {
 // - Successful type assertion and data retrieval
 // - Error handling for non-existent keys
 func TestReadPluginStateKey(t *testing.T) {
-	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+	ctx, cancel := context.WithCancel(logutil.NewTestLoggerIntoContext(context.Background()))
+	t.Cleanup(cancel)
 	state := NewPluginState(ctx)
 
 	requestID := "req-1"
@@ -192,7 +196,8 @@ func TestReadPluginStateKey(t *testing.T) {
 // It tests that data which hasn't been accessed for longer than stalenessThreshold
 // is properly removed from the storage.
 func TestPluginState_Cleanup(t *testing.T) {
-	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+	ctx, cancel := context.WithCancel(logutil.NewTestLoggerIntoContext(context.Background()))
+	t.Cleanup(cancel)
 
 	state := NewPluginState(ctx)
 
@@ -213,7 +218,8 @@ func TestPluginState_Cleanup(t *testing.T) {
 
 // TestPluginState_DeleteKey verifies that DeleteKey correctly removes only the specified key for a request.
 func TestPluginState_DeleteKey(t *testing.T) {
-	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+	ctx, cancel := context.WithCancel(logutil.NewTestLoggerIntoContext(context.Background()))
+	t.Cleanup(cancel)
 	state := NewPluginState(ctx)
 
 	requestID := "req-1"
