@@ -91,23 +91,27 @@ func (s *PluginState) Write(requestID string, key StateKey, val StateData) {
 	s.storage.Store(requestID, stateData)
 }
 
-// Delete deletes data associated with the given requestID.
-// It is possible to call Delete explicitly when the handling of a request is completed
-// or alternatively, if the request failed during its processing, a cleanup goroutine will
-// clean data of stale requests.
+// Delete deletes data associated with the given requestID from PluginState.
 //
-// Note: Delete triggers the OnEvicted callback for every EvictableStateData entry being removed.
+// Triggers OnEvicted for every EvictableStateData entry being removed.
+// OnEvicted is invoked at most once per entry: Delete uses LoadAndDelete
+// per key, so it does not fire OnEvicted on entries that were concurrently
+// removed by a racing DeleteKey (or another Delete) on the same requestID.
 func (s *PluginState) Delete(requestID string) {
 	s.requestToLastAccessTime.Delete(requestID)
-	if val, ok := s.storage.LoadAndDelete(requestID); ok {
-		stateData := val.(*sync.Map)
-		stateData.Range(func(k, v any) bool {
-			if evictable, ok := v.(EvictableStateData); ok {
+	val, ok := s.storage.LoadAndDelete(requestID)
+	if !ok {
+		return
+	}
+	stateData := val.(*sync.Map)
+	stateData.Range(func(k, _ any) bool {
+		if claimed, ok := stateData.LoadAndDelete(k); ok {
+			if evictable, ok := claimed.(EvictableStateData); ok {
 				evictable.OnEvicted(requestID, k.(StateKey))
 			}
-			return true
-		})
-	}
+		}
+		return true
+	})
 }
 
 // DeleteKey deletes the data associated with the given "key" in the context of "requestID" from PluginState.
