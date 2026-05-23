@@ -642,6 +642,7 @@ func TestInFlightLoadProducer_PanicSafety(t *testing.T) {
 		require.NotPanics(t, func() {
 			producer.PreRequest(ctx, nil, res)
 		})
+		require.Equal(t, int64(0), producer.requestTracker.get(fullEndpointName("ep1")), "should not increment counters without request")
 
 		// 3. Empty ProfileResults
 		resEmpty := &fwksched.SchedulingResult{ProfileResults: map[string]*fwksched.ProfileRunResult{}}
@@ -654,7 +655,7 @@ func TestInFlightLoadProducer_PanicSafety(t *testing.T) {
 			ProfileResults: map[string]*fwksched.ProfileRunResult{"default": nil},
 		}
 		require.NotPanics(t, func() {
-			producer.PreRequest(ctx, &fwksched.InferenceRequest{}, resNilProfile)
+			producer.PreRequest(ctx, &fwksched.InferenceRequest{RequestID: "req1"}, resNilProfile)
 		})
 
 		// 5. Empty TargetEndpoints
@@ -664,7 +665,7 @@ func TestInFlightLoadProducer_PanicSafety(t *testing.T) {
 			},
 		}
 		require.NotPanics(t, func() {
-			producer.PreRequest(ctx, &fwksched.InferenceRequest{}, resEmptyEndpoints)
+			producer.PreRequest(ctx, &fwksched.InferenceRequest{RequestID: "req1"}, resEmptyEndpoints)
 		})
 
 		// 6. Nil Endpoint in TargetEndpoints
@@ -674,7 +675,7 @@ func TestInFlightLoadProducer_PanicSafety(t *testing.T) {
 			},
 		}
 		require.NotPanics(t, func() {
-			producer.PreRequest(ctx, &fwksched.InferenceRequest{}, resNilEndpoint)
+			producer.PreRequest(ctx, &fwksched.InferenceRequest{RequestID: "req1"}, resNilEndpoint)
 		})
 
 		// 7. Endpoint with nil metadata
@@ -686,8 +687,19 @@ func TestInFlightLoadProducer_PanicSafety(t *testing.T) {
 			},
 		}
 		require.NotPanics(t, func() {
-			producer.PreRequest(ctx, &fwksched.InferenceRequest{}, resNilMeta)
+			producer.PreRequest(ctx, &fwksched.InferenceRequest{RequestID: "req1"}, resNilMeta)
 		})
+
+		// 8. Missing RequestID (Leak check)
+		resLeak := &fwksched.SchedulingResult{
+			ProfileResults: map[string]*fwksched.ProfileRunResult{
+				"default": {TargetEndpoints: []fwksched.Endpoint{newStubSchedulingEndpoint("ep-leak")}},
+			},
+		}
+		require.NotPanics(t, func() {
+			producer.PreRequest(ctx, &fwksched.InferenceRequest{RequestID: ""}, resLeak)
+		})
+		require.Equal(t, int64(0), producer.requestTracker.get(fullEndpointName("ep-leak")), "should not increment counters with empty RequestID")
 	})
 
 	t.Run("ResponseBody", func(t *testing.T) {

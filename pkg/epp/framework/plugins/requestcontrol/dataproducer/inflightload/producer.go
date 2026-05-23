@@ -185,6 +185,11 @@ func (p *InFlightLoadProducer) PreRequest(ctx context.Context, request *fwksched
 		return
 	}
 
+	if request == nil || request.RequestID == "" || p.PluginState == nil {
+		log.FromContext(ctx).V(logutil.DEFAULT).Info("Skipping in-flight load tracking: missing RequestID or PluginState")
+		return
+	}
+
 	inputTokens := p.tokenEstimator.EstimateInput(request)
 
 	for profileName, profileResult := range result.ProfileResults {
@@ -211,20 +216,19 @@ func (p *InFlightLoadProducer) PreRequest(ctx context.Context, request *fwksched
 		}
 
 		p.tokenTracker.add(eid, tokens)
-		if request != nil && request.RequestID != "" && p.PluginState != nil {
-			entry := &addedTokensEntry{
-				endpointID:     eid,
-				tokenTracker:   p.tokenTracker,
-				requestTracker: p.requestTracker,
-			}
-			entry.tokens.Store(tokens)
-			entry.requests.Store(1)
-			p.PluginState.Write(
-				request.RequestID,
-				fwkplugin.StateKey(addedTokensKey(eid, profileName)),
-				entry,
-			)
+
+		entry := &addedTokensEntry{
+			endpointID:     eid,
+			tokenTracker:   p.tokenTracker,
+			requestTracker: p.requestTracker,
 		}
+		entry.tokens.Store(tokens)
+		entry.requests.Store(1)
+		p.PluginState.Write(
+			request.RequestID,
+			fwkplugin.StateKey(addedTokensKey(eid, profileName)),
+			entry,
+		)
 	}
 }
 
