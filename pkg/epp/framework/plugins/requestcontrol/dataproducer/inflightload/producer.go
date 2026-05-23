@@ -50,8 +50,15 @@ type InFlightLoadProducerParameters struct {
 }
 
 func InFlightLoadProducerFactory(name string, rawParameters json.RawMessage, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
+	if handle == nil {
+		return nil, fmt.Errorf("handle is nil")
+	}
+	ctx := handle.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cfg := InFlightLoadProducerParameters{}
-	if rawParameters != nil {
+	if len(rawParameters) > 0 {
 		if err := json.Unmarshal(rawParameters, &cfg); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal inflight-load-producer parameters: %w", err)
 		}
@@ -63,7 +70,7 @@ func InFlightLoadProducerFactory(name string, rawParameters json.RawMessage, han
 		tokenEstimator:           NewSimpleTokenEstimator(),
 		addEstimatedOutputTokens: cfg.AddEstimatedOutputTokens,
 		dk:                       attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName(name),
-		PluginState:              fwkplugin.NewPluginState(handle.Context()),
+		PluginState:              fwkplugin.NewPluginState(ctx),
 	}, nil
 }
 
@@ -101,10 +108,20 @@ type addedTokensEntry struct {
 
 var _ fwkplugin.EvictableStateData = (*addedTokensEntry)(nil)
 
-// Clone returns the same pointer. These entries hold counter handles, not
-// snapshotable data, and are written exactly once per (request, endpoint,
-// profile) — they are never legitimately cloned.
-func (e *addedTokensEntry) Clone() fwkplugin.StateData { return e }
+// Clone returns a distinct copy of the entry with the current atomic values.
+// The tracker references remain shared, but the cloned state object itself is
+// independent so later mutation or eviction of the clone does not alias the
+// original entry.
+func (e *addedTokensEntry) Clone() fwkplugin.StateData {
+	clone := &addedTokensEntry{
+		endpointID:     e.endpointID,
+		tokenTracker:   e.tokenTracker,
+		requestTracker: e.requestTracker,
+	}
+	clone.tokens.Store(e.tokens.Load())
+	clone.requests.Store(e.requests.Load())
+	return clone
+}
 
 func (e *addedTokensEntry) OnEvicted(_ string, _ fwkplugin.StateKey) {
 	if t := e.tokens.Swap(0); t != 0 {
@@ -137,7 +154,7 @@ func (p *InFlightLoadProducer) ExpectedInputType() reflect.Type {
 
 // ExtractEndpoint handles endpoint deletion events to prune stateful trackers.
 func (p *InFlightLoadProducer) ExtractEndpoint(ctx context.Context, event datalayer.EndpointEvent) error {
-	if event.Type != datalayer.EventDelete || event.Endpoint == nil {
+	if event.Type != datalayer.EventDelete || event.Endpoint == nil || event.Endpoint.GetMetadata() == nil {
 		return nil
 	}
 
@@ -150,6 +167,9 @@ func (p *InFlightLoadProducer) ExtractEndpoint(ctx context.Context, event datala
 
 func (p *InFlightLoadProducer) Produce(_ context.Context, _ *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) error {
 	for _, e := range endpoints {
+		if e == nil || e.GetMetadata() == nil {
+			continue
+		}
 		endpointID := e.GetMetadata().NamespacedName.String()
 		e.Put(p.dk.String(), &attrconcurrency.InFlightLoad{
 			Tokens:   p.tokenTracker.get(endpointID),
@@ -232,7 +252,11 @@ func (p *InFlightLoadProducer) ResponseBody(
 			if profileResult == nil || len(profileResult.TargetEndpoints) == 0 {
 				continue
 			}
-			p.releaseTokensEarly(profileResult.TargetEndpoints[0], request, profileName)
+			endpoint := profileResult.TargetEndpoints[0]
+			if endpoint == nil || endpoint.GetMetadata() == nil {
+				continue
+			}
+			p.releaseTokensEarly(endpoint, request, profileName)
 		}
 	}
 
@@ -240,7 +264,10 @@ func (p *InFlightLoadProducer) ResponseBody(
 	// Uses the new StartOfStream signal provided by the framework.
 	if p.addEstimatedOutputTokens && resp.StartOfStream {
 		if prefillResult, ok := result.ProfileResults[profilePrefill]; ok && len(prefillResult.TargetEndpoints) > 0 {
-			p.release(prefillResult.TargetEndpoints[0], request, profilePrefill)
+			endpoint := prefillResult.TargetEndpoints[0]
+			if endpoint != nil && endpoint.GetMetadata() != nil {
+				p.release(endpoint, request, profilePrefill)
+			}
 		}
 	}
 
@@ -283,10 +310,14 @@ func (p *InFlightLoadProducer) ResponseBody(
 }
 
 func (p *InFlightLoadProducer) release(endpoint fwksched.Endpoint, request *fwksched.InferenceRequest, profileName string) {
-	if endpoint == nil || endpoint.GetMetadata() == nil || request == nil || request.RequestID == "" || p.PluginState == nil {
+	if endpoint == nil || request == nil || request.RequestID == "" || p.PluginState == nil {
 		return
 	}
-	eid := endpoint.GetMetadata().NamespacedName.String()
+	meta := endpoint.GetMetadata()
+	if meta == nil {
+		return
+	}
+	eid := meta.NamespacedName.String()
 	key := fwkplugin.StateKey(addedTokensKey(eid, profileName))
 
 	// DeleteKey triggers OnEvicted, which decrements the counters exactly once.
@@ -295,10 +326,14 @@ func (p *InFlightLoadProducer) release(endpoint fwksched.Endpoint, request *fwks
 }
 
 func (p *InFlightLoadProducer) releaseTokensEarly(endpoint fwksched.Endpoint, request *fwksched.InferenceRequest, profileName string) {
-	if endpoint == nil || endpoint.GetMetadata() == nil || request == nil || request.RequestID == "" || p.PluginState == nil {
+	if endpoint == nil || request == nil || request.RequestID == "" || p.PluginState == nil {
 		return
 	}
-	eid := endpoint.GetMetadata().NamespacedName.String()
+	meta := endpoint.GetMetadata()
+	if meta == nil {
+		return
+	}
+	eid := meta.NamespacedName.String()
 
 	key := fwkplugin.StateKey(addedTokensKey(eid, profileName))
 	if entry, err := fwkplugin.ReadPluginStateKey[*addedTokensEntry](p.PluginState, request.RequestID, key); err == nil {
