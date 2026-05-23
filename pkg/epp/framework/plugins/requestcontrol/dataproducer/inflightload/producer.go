@@ -114,6 +114,9 @@ var _ fwkplugin.EvictableStateData = (*addedTokensEntry)(nil)
 // independent so later mutation or eviction of the clone does not alias the
 // original entry.
 func (e *addedTokensEntry) Clone() fwkplugin.StateData {
+	if e == nil {
+		return nil
+	}
 	clone := &addedTokensEntry{
 		endpointID:     e.endpointID,
 		tokenTracker:   e.tokenTracker,
