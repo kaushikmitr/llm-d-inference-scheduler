@@ -452,10 +452,10 @@ func newConcurrencyTracker() *concurrencyTracker {
 	}
 }
 
-func (ct *concurrencyTracker) get(endpointID string) int64 {
-	ct.mu.RLock()
-	counter, exists := ct.counts[endpointID]
-	ct.mu.RUnlock()
+func (t *concurrencyTracker) get(endpointID string) int64 {
+	t.mu.RLock()
+	counter, exists := t.counts[endpointID]
+	t.mu.RUnlock()
 
 	if !exists {
 		return 0
@@ -463,39 +463,35 @@ func (ct *concurrencyTracker) get(endpointID string) int64 {
 	return counter.Load()
 }
 
-func (ct *concurrencyTracker) inc(endpointID string) {
-	ct.add(endpointID, 1)
+func (t *concurrencyTracker) inc(endpointID string) {
+	t.add(endpointID, 1)
 }
 
-func (ct *concurrencyTracker) add(endpointID string, delta int64) {
-	ct.mu.RLock()
-	counter, exists := ct.counts[endpointID]
-	ct.mu.RUnlock()
+func (t *concurrencyTracker) add(endpointID string, delta int64) {
+	t.mu.RLock()
+	counter, exists := t.counts[endpointID]
+	t.mu.RUnlock()
 
 	if exists {
 		counter.Add(delta)
 		return
 	}
 
-	ct.mu.Lock()
-	defer ct.mu.Unlock()
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
-	if counter, exists = ct.counts[endpointID]; exists {
+	if counter, exists = t.counts[endpointID]; exists {
 		counter.Add(delta)
 		return
 	}
 
 	counter = &atomic.Int64{}
 	counter.Store(delta)
-	ct.counts[endpointID] = counter
+	t.counts[endpointID] = counter
 }
 
-func (ct *concurrencyTracker) dec(endpointID string) {
-	ct.add(endpointID, -1)
-}
-
-func (ct *concurrencyTracker) delete(endpointID string) {
-	ct.mu.Lock()
-	defer ct.mu.Unlock()
-	delete(ct.counts, endpointID)
+func (t *concurrencyTracker) delete(endpointID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.counts, endpointID)
 }
