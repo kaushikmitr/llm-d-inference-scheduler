@@ -19,6 +19,7 @@ package inflightload
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"sync"
@@ -51,7 +52,7 @@ type InFlightLoadProducerParameters struct {
 
 func InFlightLoadProducerFactory(name string, rawParameters json.RawMessage, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
 	if handle == nil {
-		return nil, fmt.Errorf("handle is nil")
+		return nil, errors.New("handle is nil")
 	}
 	ctx := handle.Context()
 	if ctx == nil {
