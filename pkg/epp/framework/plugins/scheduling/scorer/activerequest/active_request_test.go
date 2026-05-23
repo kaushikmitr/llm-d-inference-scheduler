@@ -67,7 +67,7 @@ func TestActiveRequestScorer_Score(t *testing.T) {
 			endpoints: func() []scheduling.Endpoint {
 				return []scheduling.Endpoint{
 					newTestEndpointWithLoad("pod-a", 4),
-					newTestEndpointWithLoad("pod-b", 0),
+					newTestEndpoint("pod-b", 0),
 					newTestEndpointWithLoad("pod-c", 1),
 				}
 			},
