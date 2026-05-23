@@ -51,6 +51,33 @@ func (d *evictableTestData) OnEvicted(requestID string, key StateKey) {
 	d.evictedKey = key
 }
 
+// Clone implements the StateData interface, ensuring that the cloned data
+// remains evictable (OnEvicted is not lost).
+func (d *evictableTestData) Clone() StateData {
+	if d == nil {
+		return nil
+	}
+	return &evictableTestData{
+		pluginTestData: pluginTestData{value: d.value},
+		evictedID:      d.evictedID,
+		evictedKey:     d.evictedKey,
+	}
+}
+
+func TestEvictableTestData_Clone(t *testing.T) {
+	data := &evictableTestData{
+		pluginTestData: pluginTestData{value: "test"},
+	}
+	cloned := data.Clone()
+
+	evictable, ok := cloned.(EvictableStateData)
+	assert.True(t, ok, "cloned data should satisfy EvictableStateData")
+
+	evictable.OnEvicted("req-1", "key-1")
+	assert.Equal(t, "req-1", cloned.(*evictableTestData).evictedID)
+	assert.Equal(t, StateKey("key-1"), cloned.(*evictableTestData).evictedKey)
+}
+
 // TestPluginState_EvictionCallback verifies that OnEvicted is called when data is removed.
 func TestPluginState_EvictionCallback(t *testing.T) {
 	ctx, cancel := context.WithCancel(logutil.NewTestLoggerIntoContext(context.Background()))
