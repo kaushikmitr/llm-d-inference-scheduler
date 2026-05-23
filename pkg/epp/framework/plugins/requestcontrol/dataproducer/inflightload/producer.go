@@ -204,8 +204,18 @@ func (p *InFlightLoadProducer) PreRequest(ctx context.Context, request *fwksched
 		return
 	}
 
-	if request == nil || request.RequestID == "" || p.PluginState == nil {
-		log.FromContext(ctx).V(logutil.DEFAULT).Info("Skipping in-flight load tracking: missing RequestID or PluginState")
+	if request == nil {
+		log.FromContext(ctx).V(logutil.VERBOSE).Info("Skipping in-flight load tracking: request is nil")
+		return
+	}
+
+	if request.RequestID == "" {
+		log.FromContext(ctx).V(logutil.VERBOSE).Info("Skipping in-flight load tracking: missing RequestID")
+		return
+	}
+
+	if p.PluginState == nil {
+		log.FromContext(ctx).V(logutil.VERBOSE).Info("Skipping in-flight load tracking: PluginState is nil", "requestID", request.RequestID)
 		return
 	}
 
