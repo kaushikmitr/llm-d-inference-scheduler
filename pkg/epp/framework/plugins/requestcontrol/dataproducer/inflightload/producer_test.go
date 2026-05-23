@@ -459,30 +459,29 @@ func TestInFlightLoadProducer_ExcludeOutputTokens_EndOfStreamWithoutStart(t *tes
 	require.ErrorIs(t, err, fwkplugin.ErrNotFound, "PluginState entry must be released")
 }
 
-// TestInFlightLoadProducer_TTL verifies that global counters are rolled back
-// when the background janitor reaps an abandoned request from PluginState.
-func TestInFlightLoadProducer_TTL(t *testing.T) {
+// TestInFlightLoadProducer_Eviction verifies that global counters are rolled back
+// when a request is explicitly deleted from PluginState (simulating either
+// end-of-stream cleanup or janitor reaping).
+func TestInFlightLoadProducer_Eviction(t *testing.T) {
 	producer := newTestProducer(t)
 	ctx := context.Background()
-	endpointName := "abandoned-endpoint"
+	endpointName := "eviction-endpoint"
 	endpointID := fullEndpointName(endpointName)
 
 	// 1. PreRequest: Adds load
-	req := makeTokenRequest("req-abandoned", "1234567890123456") // 10 tokens
+	req := makeTokenRequest("req-eviction", "1234567890123456") // 10 tokens
 	res := makeSchedulingResult(endpointName)
 	producer.PreRequest(ctx, req, res)
 
 	require.Equal(t, int64(1), producer.requestTracker.get(endpointID))
 	require.Equal(t, int64(10), producer.tokenTracker.get(endpointID))
 
-	// 2. Simulate abandonment: Manually set last access time to far in past
-	// and run cleanStaleRequests (internal to PluginState).
-	// We use the exported Delete() which simulates what the janitor does.
+	// 2. Explicitly delete the request (simulates what the janitor or EOS cleanup does).
 	producer.PluginState.Delete(req.RequestID)
 
 	// 3. Verify counters rolled back automatically via OnEvicted callback
-	require.Equal(t, int64(0), producer.requestTracker.get(endpointID), "request counter should have rolled back via TTL")
-	require.Equal(t, int64(0), producer.tokenTracker.get(endpointID), "token counter should have rolled back via TTL")
+	require.Equal(t, int64(0), producer.requestTracker.get(endpointID), "request counter should have rolled back via Eviction")
+	require.Equal(t, int64(0), producer.tokenTracker.get(endpointID), "token counter should have rolled back via Eviction")
 }
 
 // TestInFlightLoadProducer_Touch verifies that intermediate chunks extend the
