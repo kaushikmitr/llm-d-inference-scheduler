@@ -287,7 +287,7 @@ func (p *InFlightLoadProducer) ResponseBody(
 				// Tokens are normally freed at StartOfStream; also call
 				// release here as a safety net for non-streaming or
 				// error paths where StartOfStream may not be observed. It is
-				// a no-op via LoadAndDelete if tokens were already released.
+				// a no-op via atomic swap in OnEvicted if tokens were already released.
 				p.release(endpoint, request, name)
 				continue
 			}
