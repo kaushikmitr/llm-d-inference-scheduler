@@ -124,12 +124,31 @@ func (e *addedTokensEntry) Clone() fwkplugin.StateData {
 	return clone
 }
 
+// addIfPresent applies delta only when the endpoint is still tracked.
+// This avoids recreating a deleted endpoint with a negative in-flight count
+// during delayed eviction cleanup.
+func (t *concurrencyTracker) addIfPresent(endpointID string, delta int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	counter, ok := t.counts[endpointID]
+	if !ok {
+		return
+	}
+	counter.Add(delta)
+}
+
+// decIfPresent decrements the endpoint only when it is still tracked.
+func (t *concurrencyTracker) decIfPresent(endpointID string) {
+	t.addIfPresent(endpointID, -1)
+}
+
 func (e *addedTokensEntry) OnEvicted(_ string, _ fwkplugin.StateKey) {
 	if t := e.tokens.Swap(0); t != 0 {
-		e.tokenTracker.add(e.endpointID, -t)
+		e.tokenTracker.addIfPresent(e.endpointID, -t)
 	}
 	if e.requests.Swap(0) != 0 {
-		e.requestTracker.dec(e.endpointID)
+		e.requestTracker.decIfPresent(e.endpointID)
 	}
 }
 
