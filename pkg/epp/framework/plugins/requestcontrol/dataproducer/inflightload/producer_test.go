@@ -177,10 +177,10 @@ func TestInFlightLoadProducer_ConcurrencyStress(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines)
 
-	for i := range numGoroutines {
+	for i := 0; i < numGoroutines; i++ {
 		go func(g int) {
 			defer wg.Done()
-			for j := range opsPerRoutine {
+			for j := 0; j < opsPerRoutine; j++ {
 				reqID := fmt.Sprintf("req-%d-%d", g, j)
 				res := makeSchedulingResult(endpointName)
 				req := &fwksched.InferenceRequest{RequestID: reqID, SchedulingResult: res}
