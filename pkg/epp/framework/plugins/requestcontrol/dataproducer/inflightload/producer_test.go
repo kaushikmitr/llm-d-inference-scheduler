@@ -501,17 +501,15 @@ func TestInFlightLoadProducer_Touch(t *testing.T) {
 	t1, ok := producer.PluginState.LastAccessTime(req.RequestID)
 	require.True(t, ok)
 
-	// Sleep briefly to ensure time moves forward
-	time.Sleep(2 * time.Millisecond)
+	// Simulate intermediate chunks until access time is updated.
+	// We use Eventually to handle coarse timer resolution or busy CI runners.
+	require.Eventually(t, func() bool {
+		req.SchedulingResult = res
+		producer.ResponseBody(ctx, req, &requestcontrol.Response{EndOfStream: false, StartOfStream: false}, nil)
 
-	// Simulate an intermediate chunk
-	req.SchedulingResult = res
-	producer.ResponseBody(ctx, req, &requestcontrol.Response{EndOfStream: false, StartOfStream: false}, nil)
-
-	// Verify access time was updated
-	t2, ok := producer.PluginState.LastAccessTime(req.RequestID)
-	require.True(t, ok)
-	require.True(t, t2.After(t1), "Touch should have extended the lifetime")
+		t2, ok := producer.PluginState.LastAccessTime(req.RequestID)
+		return ok && t2.After(t1)
+	}, 1*time.Second, 10*time.Millisecond, "Touch should have extended the lifetime")
 }
 
 // TestInFlightLoadProducer_LateResponseAfterReap verifies that if a ResponseBody
