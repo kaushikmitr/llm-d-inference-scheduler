@@ -741,8 +741,8 @@ func TestInFlightLoadProducer_PanicSafety(t *testing.T) {
 	})
 
 	t.Run("Factory_NilHandle", func(t *testing.T) {
-		require.NotPanics(t, func() {
-			_, _ = InFlightLoadProducerFactory("test", nil, nil)
-		})
+		p, err := InFlightLoadProducerFactory("test", nil, nil)
+		require.Error(t, err)
+		require.Nil(t, p)
 	})
 }
