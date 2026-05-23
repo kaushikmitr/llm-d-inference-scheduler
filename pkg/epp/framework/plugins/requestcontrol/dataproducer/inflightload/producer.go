@@ -362,7 +362,7 @@ func (p *InFlightLoadProducer) releaseTokensEarly(endpoint fwksched.Endpoint, re
 	key := fwkplugin.StateKey(addedTokensKey(eid, profileName))
 	if entry, err := fwkplugin.ReadPluginStateKey[*addedTokensEntry](p.PluginState, request.RequestID, key); err == nil {
 		if t := entry.tokens.Swap(0); t != 0 {
-			entry.tokenTracker.add(entry.endpointID, -t)
+			entry.tokenTracker.addIfPresent(entry.endpointID, -t)
 		}
 	}
 }
