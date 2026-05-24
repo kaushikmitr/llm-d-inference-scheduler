@@ -39,7 +39,31 @@ func TestTokenLoadScorer(t *testing.T) {
 		currentRequestEndpointImpactDK: attrconcurrency.CurrentRequestEndpointImpactDataKey.WithNonEmptyProducerName(""),
 	}
 
-	t.Run("basic scoring with request impact", func(t *testing.T) {
+	t.Run("in-flight load only", func(t *testing.T) {
+		pod1NN := types.NamespacedName{Namespace: "default", Name: "pod1"}
+		pod2NN := types.NamespacedName{Namespace: "default", Name: "pod2"}
+		pod3NN := types.NamespacedName{Namespace: "default", Name: "pod3"}
+
+		endpoints := []fwksched.Endpoint{
+			fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: pod1NN}, &fwkdl.Metrics{}, nil),
+			fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: pod2NN}, &fwkdl.Metrics{}, nil),
+			fwksched.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: pod3NN}, &fwkdl.Metrics{}, nil),
+		}
+
+		// pod1: 0 in-flight. Score = 1 - 0/1000 = 1.0
+		// pod2: 500 in-flight. Score = 1 - 500/1000 = 0.5
+		endpoints[1].Put(attrconcurrency.InFlightLoadDataKey.String(), &attrconcurrency.InFlightLoad{Tokens: 500})
+		// pod3: 1000 in-flight. Score = 1 - 1000/1000 = 0.0
+		endpoints[2].Put(attrconcurrency.InFlightLoadDataKey.String(), &attrconcurrency.InFlightLoad{Tokens: 1000})
+
+		scores := scorer.Score(context.Background(), fwksched.NewCycleState(), &fwksched.InferenceRequest{}, endpoints)
+
+		assert.InDelta(t, 1.0, scores[endpoints[0]], 0.0001, "Pod1 (0 tokens) should have score 1.0")
+		assert.InDelta(t, 0.5, scores[endpoints[1]], 0.0001, "Pod2 (500 tokens) should have score 0.5")
+		assert.InDelta(t, 0.0, scores[endpoints[2]], 0.0001, "Pod3 (1000 tokens) should have score 0.0")
+	})
+
+	t.Run("in-flight load plus current request impact", func(t *testing.T) {
 		pod1NN := types.NamespacedName{Namespace: "default", Name: "pod1"}
 		pod2NN := types.NamespacedName{Namespace: "default", Name: "pod2"}
 		pod3NN := types.NamespacedName{Namespace: "default", Name: "pod3"}
