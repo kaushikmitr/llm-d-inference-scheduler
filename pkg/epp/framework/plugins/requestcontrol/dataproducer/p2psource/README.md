@@ -45,6 +45,45 @@ available.
 - `prefixMatchInfoProducerName` (string, optional): Name of the prefix-cache producer instance that supplies `PrefixCacheMatchInfo`. Empty selects the default unnamed producer.
 - `minCachedTokenDelta` (int, optional, default: `1`): Minimum cached-token advantage required to emit the source header. Must be `>= 1`. Higher values avoid transfers for prefixes that are cheap to recompute.
 - `prefillProfileName` (string, optional, default: `prefill`): P/D disaggregation prefill profile containing the endpoint that computes the prefix. If the profile has no target, the primary profile target is used.
+- `costModel` (object, optional): When set, the header is emitted only when the pull's gain exceeds its cost, evaluated after the `minCachedTokenDelta` floor. Omitted, the fixed-delta decision applies. See [Cost model](#cost-model).
+
+## Cost model
+
+A pull saves the computing pod the prefill of `delta` tokens (the source's cached-token advantage) and costs the transfer of those tokens plus two waits that only apply on busy pods: a busy source is slow to start sending the blocks, and a busy computing pod re-admits the pulled request through its waiting queue after the blocks arrive. Both waits are constants of the busy state, not of queue depth. The header is emitted when
+
+```text
+delta * (prefill - transfer) + fleetWeight * busy(d) * delta * prefill
+  > transferFixed + busy(s) * sourceWait + busy(d) * requeue
+```
+
+where `busy(x)` is true when pod `x` has at least `busyQueueThreshold` requests waiting. `fleetWeight` credits a pull on a busy computing pod with the prefill time it frees for the other requests there; at 0 the decision optimizes the pulled request's own latency only.
+
+Parameters, all measured on the serving fleet (an idle ladder of pull versus recompute at several prefix lengths gives the first three; one probe each with a busy source and a busy computing pod gives the waits):
+
+- `prefillMicrosecondsPerToken` (float, required): prefill cost per token on the computing pod.
+- `transferMicrosecondsPerToken` (float, required): P2P transfer cost per token; must be below the prefill cost.
+- `transferFixedMs` (float, optional, default `0`): fixed cost of a pull on idle pods.
+- `sourceWaitMs` (float, optional, default `0`): added when the source is busy.
+- `requeueMs` (float, optional, default `0`): added when the computing pod is busy.
+- `fleetWeight` (float, optional, default `0`): weight of the freed prefill time on a busy computing pod.
+- `busyQueueThreshold` (int, optional, default `1`): waiting-queue depth at or above which a pod counts as busy.
+
+Example values from a B200 fleet running gpt-oss-120b over RDMA: prefill 19, transfer 3.9, transferFixed 15, sourceWait 350, requeue 500. With those, the pull is emitted from about 1K tokens when both pods are idle and from about 34K tokens when the computing pod is busy.
+
+```yaml
+  - type: p2p-source-producer
+    name: p2p-cache-source
+    parameters:
+      prefixMatchInfoProducerName: precise-cache
+      minCachedTokenDelta: 256
+      costModel:
+        prefillMicrosecondsPerToken: 19
+        transferMicrosecondsPerToken: 3.9
+        transferFixedMs: 15
+        sourceWaitMs: 350
+        requeueMs: 500
+        fleetWeight: 0
+```
 
 ## Configuration
 

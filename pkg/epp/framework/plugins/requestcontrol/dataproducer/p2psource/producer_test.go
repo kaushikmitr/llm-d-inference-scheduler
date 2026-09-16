@@ -787,3 +787,199 @@ func TestPreRequest_SpeculativeComputingCacheDoesNotSuppressHeader(t *testing.T)
 
 	assert.Equal(t, "10.0.0.1:8080", req.Headers[routing.KVCacheSourceHeader])
 }
+
+// ---- cost model ----
+
+// rigCostModel carries the constants measured on the B200 RDMA testbed.
+func rigCostModel() *CostModelConfig {
+	return &CostModelConfig{
+		PrefillMicrosecondsPerToken:  19,
+		TransferMicrosecondsPerToken: 3.9,
+		TransferFixedMs:              15,
+		SourceWaitMs:                 350,
+		RequeueMs:                    500,
+		FleetWeight:                  0,
+		BusyQueueThreshold:           1,
+	}
+}
+
+// queuedEndpoint builds a candidate with the given waiting-queue depth.
+func queuedEndpoint(p *Producer, name, address string, cachedBlocks, waiting int) scheduling.Endpoint {
+	e := scheduling.NewEndpoint(&fwkdl.EndpointMetadata{
+		ID:      k8stypes.NamespacedName{Name: name},
+		Address: address,
+		Port:    "8080",
+	}, &fwkdl.Metrics{WaitingQueueSize: waiting}, nil)
+	e.Put(p.prefixMatchDataKey,
+		attrprefix.NewPrefixCacheMatchInfo(cachedBlocks, 4, testBlockSize).WithCachedBlockCount(cachedBlocks))
+	return e
+}
+
+func costRequest(p *Producer, id string, sourceCachedTokens, sourceWaiting int) *scheduling.InferenceRequest {
+	req := &scheduling.InferenceRequest{RequestID: id, Headers: map[string]string{}}
+	req.PutAttribute(p.attrKey(), &bestMatchPeer{hostPort: "10.0.0.2:8080", cachedTokens: sourceCachedTokens, waitingQueue: sourceWaiting})
+	return req
+}
+
+// Factory parses the optional costModel block.
+func TestPluginFactory_CostModel_Parsed(t *testing.T) {
+	raw := `{"minCachedTokenDelta": 256, "costModel": {"prefillMicrosecondsPerToken": 19, "transferMicrosecondsPerToken": 3.9,
+		"transferFixedMs": 15, "sourceWaitMs": 350, "requeueMs": 500, "fleetWeight": 0.5, "busyQueueThreshold": 2}}`
+	pl, err := PluginFactory("test", json.NewDecoder(strings.NewReader(raw)), nil)
+	require.NoError(t, err)
+	p := pl.(*Producer)
+	require.NotNil(t, p.costModel)
+	assert.Equal(t, 19.0, p.costModel.PrefillMicrosecondsPerToken)
+	assert.Equal(t, 3.9, p.costModel.TransferMicrosecondsPerToken)
+	assert.Equal(t, 15.0, p.costModel.TransferFixedMs)
+	assert.Equal(t, 350.0, p.costModel.SourceWaitMs)
+	assert.Equal(t, 500.0, p.costModel.RequeueMs)
+	assert.Equal(t, 0.5, p.costModel.FleetWeight)
+	assert.Equal(t, 2, p.costModel.BusyQueueThreshold)
+}
+
+// busyQueueThreshold omitted or 0 defaults to 1.
+func TestPluginFactory_CostModel_DefaultsBusyQueueThreshold(t *testing.T) {
+	raw := `{"costModel": {"prefillMicrosecondsPerToken": 19, "transferMicrosecondsPerToken": 3.9}}`
+	pl, err := PluginFactory("test", json.NewDecoder(strings.NewReader(raw)), nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, pl.(*Producer).costModel.BusyQueueThreshold)
+}
+
+// Without a costModel block the producer keeps the fixed-delta behavior.
+func TestPluginFactory_NoCostModel_Nil(t *testing.T) {
+	pl, err := PluginFactory("test", json.NewDecoder(strings.NewReader(`{"minCachedTokenDelta": 4}`)), nil)
+	require.NoError(t, err)
+	assert.Nil(t, pl.(*Producer).costModel)
+}
+
+// The transfer must be cheaper per token than the prefill, or no pull can ever win.
+func TestPluginFactory_CostModel_RejectsTransferNotBelowPrefill(t *testing.T) {
+	raw := `{"costModel": {"prefillMicrosecondsPerToken": 4, "transferMicrosecondsPerToken": 4}}`
+	_, err := PluginFactory("test", json.NewDecoder(strings.NewReader(raw)), nil)
+	require.Error(t, err)
+}
+
+// Negative constants are rejected.
+func TestPluginFactory_CostModel_RejectsNegative(t *testing.T) {
+	for _, raw := range []string{
+		`{"costModel": {"prefillMicrosecondsPerToken": 19, "transferMicrosecondsPerToken": 3.9, "requeueMs": -1}}`,
+		`{"costModel": {"prefillMicrosecondsPerToken": 19, "transferMicrosecondsPerToken": 3.9, "fleetWeight": -0.1}}`,
+		`{"costModel": {"prefillMicrosecondsPerToken": 19, "transferMicrosecondsPerToken": 3.9, "busyQueueThreshold": -1}}`,
+	} {
+		_, err := PluginFactory("test", json.NewDecoder(strings.NewReader(raw)), nil)
+		require.Error(t, err, raw)
+	}
+}
+
+// Both pods idle, 8K delta: gain 8192*(19-3.9) us = 124 ms > t0 15 ms -> pull.
+func TestPreRequest_CostModel_IdlePull(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	p := New("test", Config{MinCachedTokenDelta: 1, CostModel: rigCostModel()})
+
+	req := costRequest(p, "req-idle", 8192, 0)
+	_ = p.PreRequest(ctx, req, decodeOnly(queuedEndpoint(p, "pod-a", "10.0.0.1", 0, 0)))
+
+	assert.Equal(t, "10.0.0.2:8080", req.Headers[routing.KVCacheSourceHeader])
+}
+
+// Both pods idle, 512-token delta: gain 7.7 ms < t0 15 ms -> recompute.
+func TestPreRequest_CostModel_IdleSmallDelta_NoHeader(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	p := New("test", Config{MinCachedTokenDelta: 1, CostModel: rigCostModel()})
+
+	req := costRequest(p, "req-small", 512, 0)
+	_ = p.PreRequest(ctx, req, decodeOnly(queuedEndpoint(p, "pod-a", "10.0.0.1", 0, 0)))
+
+	assert.NotContains(t, req.Headers, routing.KVCacheSourceHeader)
+}
+
+// Busy destination adds requeue: 8K gain 124 ms < 15 + 500 -> recompute.
+func TestPreRequest_CostModel_BusyDestination_NoHeader(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	p := New("test", Config{MinCachedTokenDelta: 1, CostModel: rigCostModel()})
+
+	req := costRequest(p, "req-busy-d", 8192, 0)
+	_ = p.PreRequest(ctx, req, decodeOnly(queuedEndpoint(p, "pod-a", "10.0.0.1", 0, 1)))
+
+	assert.NotContains(t, req.Headers, routing.KVCacheSourceHeader)
+}
+
+// Busy destination, 64K delta: gain 990 ms > 515 -> pull.
+func TestPreRequest_CostModel_BusyDestination_LongDelta_Pull(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	p := New("test", Config{MinCachedTokenDelta: 1, CostModel: rigCostModel()})
+
+	req := costRequest(p, "req-busy-d-long", 65536, 0)
+	_ = p.PreRequest(ctx, req, decodeOnly(queuedEndpoint(p, "pod-a", "10.0.0.1", 0, 1)))
+
+	assert.Equal(t, "10.0.0.2:8080", req.Headers[routing.KVCacheSourceHeader])
+}
+
+// Busy source adds srcwait: 8K gain 124 ms < 15 + 350 -> recompute.
+func TestPreRequest_CostModel_BusySource_NoHeader(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	p := New("test", Config{MinCachedTokenDelta: 1, CostModel: rigCostModel()})
+
+	req := costRequest(p, "req-busy-s", 8192, 1)
+	_ = p.PreRequest(ctx, req, decodeOnly(queuedEndpoint(p, "pod-a", "10.0.0.1", 0, 0)))
+
+	assert.NotContains(t, req.Headers, routing.KVCacheSourceHeader)
+}
+
+// busyQueueThreshold: a queue below the threshold does not count as busy.
+func TestPreRequest_CostModel_BusyQueueThreshold(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	cm := rigCostModel()
+	cm.BusyQueueThreshold = 3
+	p := New("test", Config{MinCachedTokenDelta: 1, CostModel: cm})
+
+	req := costRequest(p, "req-thr", 8192, 2)
+	_ = p.PreRequest(ctx, req, decodeOnly(queuedEndpoint(p, "pod-a", "10.0.0.1", 0, 2)))
+
+	assert.Equal(t, "10.0.0.2:8080", req.Headers[routing.KVCacheSourceHeader])
+}
+
+// Fleet weight credits the destination's freed prefill: 32K on a busy
+// destination is 495 ms < 515 at w=0 (recompute) and 495 + 623 > 515 at w=1 (pull).
+func TestPreRequest_CostModel_FleetWeightFlipsDecision(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	for _, tc := range []struct {
+		w    float64
+		pull bool
+	}{{0, false}, {1, true}} {
+		cm := rigCostModel()
+		cm.FleetWeight = tc.w
+		p := New("test", Config{MinCachedTokenDelta: 1, CostModel: cm})
+
+		req := costRequest(p, "req-fleet", 32768, 0)
+		_ = p.PreRequest(ctx, req, decodeOnly(queuedEndpoint(p, "pod-a", "10.0.0.1", 0, 1)))
+
+		_, set := req.Headers[routing.KVCacheSourceHeader]
+		assert.Equal(t, tc.pull, set, "fleetWeight=%v", tc.w)
+	}
+}
+
+// minCachedTokenDelta remains a floor under the cost model.
+func TestPreRequest_CostModel_RespectsMinCachedTokenDelta(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	p := New("test", Config{MinCachedTokenDelta: 16384, CostModel: rigCostModel()})
+
+	req := costRequest(p, "req-floor", 8192, 0)
+	_ = p.PreRequest(ctx, req, decodeOnly(queuedEndpoint(p, "pod-a", "10.0.0.1", 0, 0)))
+
+	assert.NotContains(t, req.Headers, routing.KVCacheSourceHeader)
+}
+
+// Produce stashes the sampled source's waiting-queue depth for PreRequest.
+func TestProduce_StashesSourceWaitingQueue(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	p := New("test", Config{MinCachedTokenDelta: 1})
+
+	req := &scheduling.InferenceRequest{RequestID: "req-wq"}
+	require.NoError(t, p.Produce(ctx, req, []scheduling.Endpoint{queuedEndpoint(p, "pod-b", "10.0.0.2", 3, 3)}))
+
+	best, ok := scheduling.ReadRequestAttribute[*bestMatchPeer](req, p.attrKey())
+	require.True(t, ok)
+	assert.Equal(t, 3, best.waitingQueue)
+}
