@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"math"
 	"net"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -128,6 +129,18 @@ func (c *CostModelConfig) validate() error {
 
 func (c *CostModelConfig) busy(waitingQueue int) bool {
 	return waitingQueue >= c.BusyQueueThreshold
+}
+
+// sourceCost ranks a pull source before the computing pod is known: the wait
+// a busy source adds, plus the recompute the destination pays for every
+// token this source holds short of the best-cached one. The computing pod's
+// own terms are equal across sources and drop out.
+func (c *CostModelConfig) sourceCost(cached, maxCached, waitingQueue int) float64 {
+	cost := float64(maxCached-cached) * (c.PrefillMicrosecondsPerToken - c.TransferMicrosecondsPerToken) / 1000
+	if c.busy(waitingQueue) {
+		cost += c.SourceWaitMs
+	}
+	return cost
 }
 
 // evaluate returns the pull's gain and cost in milliseconds for a
@@ -261,7 +274,12 @@ func (p *Producer) attrKey() plugin.DataKey {
 // the destination a single block of recompute, noise next to a queue-depth
 // difference on the source. Proportional weights spread ties uniformly,
 // mildly prefer a one-request-shorter queue, and starve deeply-queued
-// sources. No-op when no candidate holds any cached block.
+// sources. With a cost model, every source is ranked by the wait it adds
+// plus the recompute its cache shortfall costs (CostModelConfig.sourceCost),
+// and the sample is uniform among sources within one block's recompute of
+// the minimum, so an idle source beats a busy one unless the busy one's extra
+// cache outweighs the source wait. No-op when no candidate holds any cached
+// block.
 func (p *Producer) Produce(ctx context.Context, request *scheduling.InferenceRequest, endpoints []scheduling.Endpoint) error {
 	// Endpoints without metadata cannot serve as sources (no address to
 	// join), so they must not pin the pool maximum either: an inflated
@@ -293,14 +311,35 @@ func (p *Producer) Produce(ctx context.Context, request *scheduling.InferenceReq
 		var candidates []sourceMatch
 		var weights []float64
 		total := 0.0
-		for _, m := range matches {
-			if m.cached+m.blockSize < maxCached {
-				continue
+		if p.costModel != nil {
+			// Cost-aware pick: every source is ranked by sourceCost, so an idle
+			// source beats a busy one unless the busy one's extra cache is worth
+			// more than the source wait. Sources within one block's recompute of
+			// the minimum are sampled uniformly, keeping the anti-herding band.
+			costs := make([]float64, len(matches))
+			minCost := math.Inf(1)
+			for i, m := range matches {
+				costs[i] = p.costModel.sourceCost(m.cached, maxCached, waitingQueueSize(m.ep))
+				minCost = math.Min(minCost, costs[i])
 			}
-			w := 1.0 / (1.0 + float64(waitingQueueSize(m.ep)))
-			candidates = append(candidates, m)
-			weights = append(weights, w)
-			total += w
+			for i, m := range matches {
+				if costs[i]-minCost > p.costModel.sourceCost(0, m.blockSize, 0) {
+					continue
+				}
+				candidates = append(candidates, m)
+				weights = append(weights, 1)
+				total++
+			}
+		} else {
+			for _, m := range matches {
+				if m.cached+m.blockSize < maxCached {
+					continue
+				}
+				w := 1.0 / (1.0 + float64(waitingQueueSize(m.ep)))
+				candidates = append(candidates, m)
+				weights = append(weights, w)
+				total += w
+			}
 		}
 		if len(candidates) > 0 {
 			target := requestSpreadFraction(request.RequestID) * total

@@ -934,7 +934,7 @@ func TestPreRequest_CostModel_BusyQueueThreshold(t *testing.T) {
 	cm.BusyQueueThreshold = 3
 	p := New("test", Config{MinCachedTokenDelta: 1, CostModel: cm})
 
-	req := costRequest(p, "req-thr", 8192, 2)
+	req := costRequest(p, "req-threshold", 8192, 2)
 	_ = p.PreRequest(ctx, req, decodeOnly(queuedEndpoint(p, "pod-a", "10.0.0.1", 0, 2)))
 
 	assert.Equal(t, "10.0.0.2:8080", req.Headers[routing.KVCacheSourceHeader])
@@ -982,4 +982,102 @@ func TestProduce_StashesSourceWaitingQueue(t *testing.T) {
 	best, ok := scheduling.ReadRequestAttribute[*bestMatchPeer](req, p.attrKey())
 	require.True(t, ok)
 	assert.Equal(t, 3, best.waitingQueue)
+}
+
+// ---- cost-aware source pick ----
+
+func bestHost(t *testing.T, p *Producer, req *scheduling.InferenceRequest) string {
+	t.Helper()
+	best, ok := scheduling.ReadRequestAttribute[*bestMatchPeer](req, p.attrKey())
+	require.True(t, ok)
+	return best.hostPort
+}
+
+// With the cost model, an idle source one block short beats a busy source:
+// a block of recompute costs milliseconds, the source wait hundreds.
+func TestProduce_CostModel_PrefersIdleSourceOverBusyWithMoreCache(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	p := New("test", Config{MinCachedTokenDelta: 1, CostModel: rigCostModel()})
+
+	req := &scheduling.InferenceRequest{RequestID: "req-pick-idle"}
+	require.NoError(t, p.Produce(ctx, req, []scheduling.Endpoint{
+		queuedEndpoint(p, "busy-more", "10.0.0.1", 8, 2),
+		queuedEndpoint(p, "idle-less", "10.0.0.2", 7, 0),
+	}))
+	assert.Equal(t, "10.0.0.2:8080", bestHost(t, p, req))
+}
+
+// With the cost model, an idle source far outside the one-block band still
+// wins over a busy one when its recompute shortfall is cheaper than the wait.
+func TestProduce_CostModel_IdleSourceOutsideBandWins(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	p := New("test", Config{MinCachedTokenDelta: 1, CostModel: rigCostModel()})
+
+	// 8192 vs 4096 tokens: 4096 * 15.1 us = 62 ms of extra recompute < 350 ms source wait.
+	req := &scheduling.InferenceRequest{RequestID: "req-pick-band"}
+	require.NoError(t, p.Produce(ctx, req, []scheduling.Endpoint{
+		queuedEndpoint(p, "busy-8k", "10.0.0.1", 8192/testBlockSize, 1),
+		queuedEndpoint(p, "idle-4k", "10.0.0.2", 4096/testBlockSize, 0),
+	}))
+	assert.Equal(t, "10.0.0.2:8080", bestHost(t, p, req))
+}
+
+// A busy source keeps winning when its extra cache is worth more than the wait.
+func TestProduce_CostModel_BusySourceWithMuchMoreCacheWins(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	p := New("test", Config{MinCachedTokenDelta: 1, CostModel: rigCostModel()})
+
+	// 32768 vs 1024 tokens: 31744 * 15.1 us = 479 ms of extra recompute > 350 ms source wait.
+	req := &scheduling.InferenceRequest{RequestID: "req-pick-busy"}
+	require.NoError(t, p.Produce(ctx, req, []scheduling.Endpoint{
+		queuedEndpoint(p, "busy-32k", "10.0.0.1", 32768/testBlockSize, 1),
+		queuedEndpoint(p, "idle-1k", "10.0.0.2", 1024/testBlockSize, 0),
+	}))
+	assert.Equal(t, "10.0.0.1:8080", bestHost(t, p, req))
+}
+
+// Both idle: the larger cache wins.
+func TestProduce_CostModel_BothIdle_MoreCacheWins(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	p := New("test", Config{MinCachedTokenDelta: 1, CostModel: rigCostModel()})
+
+	req := &scheduling.InferenceRequest{RequestID: "req-pick-idle2"}
+	require.NoError(t, p.Produce(ctx, req, []scheduling.Endpoint{
+		queuedEndpoint(p, "idle-4", "10.0.0.1", 4, 0),
+		queuedEndpoint(p, "idle-8", "10.0.0.2", 8, 0),
+	}))
+	assert.Equal(t, "10.0.0.2:8080", bestHost(t, p, req))
+}
+
+// Equal-cost sources are spread across requests rather than herded.
+func TestProduce_CostModel_EqualCostSpread(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	p := New("test", Config{MinCachedTokenDelta: 1, CostModel: rigCostModel()})
+
+	seen := map[string]bool{}
+	for i := 0; i < 64; i++ {
+		req := &scheduling.InferenceRequest{RequestID: fmt.Sprintf("req-spread-%d", i)}
+		require.NoError(t, p.Produce(ctx, req, []scheduling.Endpoint{
+			queuedEndpoint(p, "idle-a", "10.0.0.1", 8, 0),
+			queuedEndpoint(p, "idle-b", "10.0.0.2", 8, 0),
+		}))
+		seen[bestHost(t, p, req)] = true
+	}
+	assert.Len(t, seen, 2)
+}
+
+// The stashed source keeps the chosen pod's own queue depth and cache count.
+func TestProduce_CostModel_StashesChosenSourceState(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	p := New("test", Config{MinCachedTokenDelta: 1, CostModel: rigCostModel()})
+
+	req := &scheduling.InferenceRequest{RequestID: "req-pick-state"}
+	require.NoError(t, p.Produce(ctx, req, []scheduling.Endpoint{
+		queuedEndpoint(p, "busy-more", "10.0.0.1", 8, 2),
+		queuedEndpoint(p, "idle-less", "10.0.0.2", 7, 0),
+	}))
+	best, ok := scheduling.ReadRequestAttribute[*bestMatchPeer](req, p.attrKey())
+	require.True(t, ok)
+	assert.Equal(t, 7*testBlockSize, best.cachedTokens)
+	assert.Equal(t, 0, best.waitingQueue)
 }

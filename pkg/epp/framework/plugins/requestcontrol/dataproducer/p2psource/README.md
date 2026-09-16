@@ -58,6 +58,8 @@ delta * (prefill - transfer) + fleetWeight * busy(d) * delta * prefill
 
 where `busy(x)` is true when pod `x` has at least `busyQueueThreshold` requests waiting. `fleetWeight` credits a pull on a busy computing pod with the prefill time it frees for the other requests there; at 0 the decision optimizes the pulled request's own latency only.
 
+The cost model also changes how the source is chosen. Instead of sampling within one block of the largest prefix weighted by queue depth, every source is ranked by the wait it adds (`sourceWait` if busy) plus the recompute the computing pod pays for the tokens it holds short of the best-cached source, `(maxCached - cached) * (prefill - transfer)`. Sources within one block's recompute of the minimum are sampled uniformly by request-ID hash. An idle source therefore beats a busy one unless the busy one's extra cache is worth more than the source wait; with the example values below, a busy source needs about 23K more cached tokens than an idle one to be chosen over it.
+
 Parameters, all measured on the serving fleet (an idle ladder of pull versus recompute at several prefix lengths gives the first three; one probe each with a busy source and a busy computing pod gives the waits):
 
 - `prefillMicrosecondsPerToken` (float, required): prefill cost per token on the computing pod.
