@@ -22,6 +22,7 @@ package p2psource
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -121,7 +122,7 @@ func (c *CostModelConfig) validate() error {
 		return fmt.Errorf("costModel.transferMicrosecondsPerToken (%v) must be below prefillMicrosecondsPerToken (%v)",
 			c.TransferMicrosecondsPerToken, c.PrefillMicrosecondsPerToken)
 	case c.TransferFixedMs < 0 || c.SourceWaitMs < 0 || c.RequeueMs < 0:
-		return fmt.Errorf("costModel wait constants must be >= 0")
+		return errors.New("costModel wait constants must be >= 0")
 	case c.FleetWeight < 0:
 		return fmt.Errorf("costModel.fleetWeight must be >= 0, got %v", c.FleetWeight)
 	case c.BusyQueueThreshold < 1:
@@ -137,7 +138,11 @@ func (c *CostModelConfig) busy(waitingQueue int) bool {
 // sourceCost ranks a pull source before the computing pod is known: the wait
 // a busy source adds, plus the recompute the destination pays for every
 // token this source holds short of the best-cached one. The computing pod's
-// own terms are equal across sources and drop out.
+// own terms are equal across sources and drop out. The shortfall is priced
+// without the fleet credit, which depends on the computing pod: the credit
+// scales every source's shortfall by the same factor, so the ranking is
+// unchanged when SourceWaitMs is 0, and with a non-zero SourceWaitMs the
+// ranking undervalues cache for a loaded computing pod.
 func (c *CostModelConfig) sourceCost(cached, maxCached, waitingQueue int) float64 {
 	cost := float64(maxCached-cached) * (c.PrefillMicrosecondsPerToken - c.TransferMicrosecondsPerToken) / 1000
 	if c.busy(waitingQueue) {
@@ -216,6 +221,12 @@ func New(name string, cfg Config) *Producer {
 	if minCachedTokenDelta < 1 {
 		minCachedTokenDelta = defaultMinCachedTokenDelta
 	}
+	costModel := cfg.CostModel
+	if costModel != nil && costModel.BusyQueueThreshold < 1 {
+		defaulted := *costModel
+		defaulted.BusyQueueThreshold = defaultBusyQueueThreshold
+		costModel = &defaulted
+	}
 	return &Producer{
 		typedName:                   plugin.TypedName{Type: PluginType, Name: name},
 		prefixMatchDataKey:          attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(cfg.PrefixMatchInfoProducerName),
@@ -223,7 +234,7 @@ func New(name string, cfg Config) *Producer {
 		minCachedTokenDelta:         minCachedTokenDelta,
 		prefillProfile:              prefillProfile,
 		attrKeyValue:                plugin.NewDataKey("best-match", PluginType).WithNonEmptyProducerName(name),
-		costModel:                   cfg.CostModel,
+		costModel:                   costModel,
 	}
 }
 

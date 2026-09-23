@@ -872,6 +872,22 @@ func TestPluginFactory_CostModel_RejectsNegative(t *testing.T) {
 	}
 }
 
+// New applies the busyQueueThreshold default for callers that bypass the
+// factory: an empty queue must not count as busy.
+func TestNew_CostModel_DefaultsBusyQueueThreshold(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	cm := rigCostModel()
+	cm.BusyQueueThreshold = 0
+	p := New("test", Config{MinCachedTokenDelta: 1, CostModel: cm})
+	assert.Equal(t, 1, p.costModel.BusyQueueThreshold)
+	assert.Equal(t, 0, cm.BusyQueueThreshold, "caller's config must not be mutated")
+
+	req := costRequest(p, "req-new-default", 8192, 0)
+	_ = p.PreRequest(ctx, req, decodeOnly(queuedEndpoint(p, "pod-a", "10.0.0.1", 0, 0)))
+
+	assert.Equal(t, "10.0.0.2:8080", req.Headers[routing.KVCacheSourceHeader])
+}
+
 // Both pods idle, 8K delta: gain 8192*(19-3.9) us = 124 ms > t0 15 ms -> pull.
 func TestPreRequest_CostModel_IdlePull(t *testing.T) {
 	ctx := utils.NewTestContext(t)

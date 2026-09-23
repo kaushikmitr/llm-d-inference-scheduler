@@ -58,7 +58,7 @@ delta * (prefill - transfer) + fleetWeight * running(d) * delta * prefill
 
 where `running(d)` is the number of requests running on the computing pod and `busy(x)` is true when pod `x` has at least `busyQueueThreshold` requests waiting. At `fleetWeight: 0` the decision optimizes the pulled request's own latency only.
 
-The cost model also changes how the source is chosen. Instead of sampling within one block of the largest prefix weighted by queue depth, every source is ranked by the wait it adds (`sourceWait` if busy) plus the recompute the computing pod pays for the tokens it holds short of the best-cached source, `(maxCached - cached) * (prefill - transfer)`. Sources within one block's recompute of the minimum are sampled uniformly by request-ID hash.
+The cost model also changes how the source is chosen. Instead of sampling within one block of the largest prefix weighted by queue depth, every source is ranked by the wait it adds (`sourceWait` if busy) plus the recompute the computing pod pays for the tokens it holds short of the best-cached source, `(maxCached - cached) * (prefill - transfer)`. Sources within one block's recompute of the minimum are sampled uniformly by request-ID hash. The source is chosen before the computing pod is known, so the ranking prices the shortfall without the `fleetWeight` credit; with `sourceWaitMs: 0` this does not change the ranking, and with a non-zero `sourceWaitMs` it undervalues cache for a loaded computing pod.
 
 Parameters:
 
