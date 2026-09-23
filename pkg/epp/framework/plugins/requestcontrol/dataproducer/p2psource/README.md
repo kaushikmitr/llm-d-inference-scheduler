@@ -49,28 +49,35 @@ available.
 
 ## Cost model
 
-A pull saves the computing pod the prefill of `delta` tokens (the source's cached-token advantage) and costs the transfer of those tokens plus two waits that only apply on busy pods: a busy source is slow to start sending the blocks, and a busy computing pod re-admits the pulled request through its waiting queue after the blocks arrive. Both waits are constants of the busy state, not of queue depth. The header is emitted when
+A pull saves the computing pod the prefill of `delta` tokens (the source's cached-token advantage) and costs the transfer of those tokens, a fixed setup cost, and a re-queue delay when the computing pod has a waiting queue: the pulled request is re-admitted through that queue after its blocks arrive. On a loaded pod a recompute also delays every running request's decode steps, while a pull delays only the pulled request; `fleetWeight` credits the pull with that freed prefill. The header is emitted when
 
 ```text
-delta * (prefill - transfer) + fleetWeight * busy(d) * delta * prefill
+delta * (prefill - transfer) + fleetWeight * running(d) * delta * prefill
   > transferFixed + busy(s) * sourceWait + busy(d) * requeue
 ```
 
-where `busy(x)` is true when pod `x` has at least `busyQueueThreshold` requests waiting. `fleetWeight` credits a pull on a busy computing pod with the prefill time it frees for the other requests there; at 0 the decision optimizes the pulled request's own latency only.
+where `running(d)` is the number of requests running on the computing pod and `busy(x)` is true when pod `x` has at least `busyQueueThreshold` requests waiting. At `fleetWeight: 0` the decision optimizes the pulled request's own latency only.
 
-The cost model also changes how the source is chosen. Instead of sampling within one block of the largest prefix weighted by queue depth, every source is ranked by the wait it adds (`sourceWait` if busy) plus the recompute the computing pod pays for the tokens it holds short of the best-cached source, `(maxCached - cached) * (prefill - transfer)`. Sources within one block's recompute of the minimum are sampled uniformly by request-ID hash. An idle source therefore beats a busy one unless the busy one's extra cache is worth more than the source wait; with the example values below, a busy source needs about 23K more cached tokens than an idle one to be chosen over it.
+The cost model also changes how the source is chosen. Instead of sampling within one block of the largest prefix weighted by queue depth, every source is ranked by the wait it adds (`sourceWait` if busy) plus the recompute the computing pod pays for the tokens it holds short of the best-cached source, `(maxCached - cached) * (prefill - transfer)`. Sources within one block's recompute of the minimum are sampled uniformly by request-ID hash.
 
-Parameters, all measured on the serving fleet (an idle ladder of pull versus recompute at several prefix lengths gives the first three; one probe each with a busy source and a busy computing pod gives the waits):
+Parameters:
 
 - `prefillMicrosecondsPerToken` (float, required): prefill cost per token on the computing pod.
 - `transferMicrosecondsPerToken` (float, required): P2P transfer cost per token; must be below the prefill cost.
-- `transferFixedMs` (float, optional, default `0`): fixed cost of a pull on idle pods.
-- `sourceWaitMs` (float, optional, default `0`): added when the source is busy.
-- `requeueMs` (float, optional, default `0`): added when the computing pod is busy.
-- `fleetWeight` (float, optional, default `0`): weight of the freed prefill time on a busy computing pod.
+- `transferFixedMs` (float, optional, default `0`): fixed cost of a pull.
+- `sourceWaitMs` (float, optional, default `0`): added when the source is busy. Pulls are served from the source's CPU tier, not its scheduler; a busy source measured no added pull latency on the fleets below.
+- `requeueMs` (float, optional, default `0`): added when the computing pod has a waiting queue.
+- `fleetWeight` (float, optional, default `0`): credit per running request on the computing pod, in units of the prefill time the pull saves.
 - `busyQueueThreshold` (int, optional, default `1`): waiting-queue depth at or above which a pod counts as busy.
 
-Example values from a B200 fleet running gpt-oss-120b over RDMA: prefill 19, transfer 3.9, transferFixed 15, sourceWait 350, requeue 500. With those, the pull is emitted from about 1K tokens when both pods are idle and from about 34K tokens when the computing pod is busy.
+`prefillMicrosecondsPerToken` and `transferMicrosecondsPerToken` come from an idle pull-versus-recompute ladder (the `calibrate-min-cached-token-delta.sh` recipe in the llm-d guides prints both). `transferFixedMs` and `requeueMs` are larger under load than on an idle pod pair, because the engine re-queues a pulled request after its blocks arrive; measure them on a loaded fleet. Values measured for gpt-oss-120b, TP=1:
+
+| Fleet | prefill | transfer | transferFixed | requeue | sourceWait |
+| --- | --- | --- | --- | --- | --- |
+| H200, pull over TCP | 33 | 16 | 400 | 400 | 0 |
+| B200, pull over RDMA | 19 | 10 | 200 | 125 | 0 |
+
+With `fleetWeight: 1`, a pod with a few requests running pulls any delta above the floor, and an idle pod pulls only deltas whose own prefill saving exceeds the fixed cost (about 23K tokens with the H200 values).
 
 ```yaml
   - type: p2p-source-producer
@@ -79,12 +86,11 @@ Example values from a B200 fleet running gpt-oss-120b over RDMA: prefill 19, tra
       prefixMatchInfoProducerName: precise-cache
       minCachedTokenDelta: 256
       costModel:
-        prefillMicrosecondsPerToken: 19
-        transferMicrosecondsPerToken: 3.9
-        transferFixedMs: 15
-        sourceWaitMs: 350
-        requeueMs: 500
-        fleetWeight: 0
+        prefillMicrosecondsPerToken: 33
+        transferMicrosecondsPerToken: 16
+        transferFixedMs: 400
+        requeueMs: 400
+        fleetWeight: 1
 ```
 
 ## Configuration

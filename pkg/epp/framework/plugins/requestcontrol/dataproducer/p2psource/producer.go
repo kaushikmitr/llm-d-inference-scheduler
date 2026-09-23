@@ -73,15 +73,16 @@ type Config struct {
 // CostModelConfig holds the calibrated constants of the pull cost model. The
 // pull is emitted when
 //
-//	delta*(prefill - transfer) + fleetWeight*busy(d)*delta*prefill
+//	delta*(prefill - transfer) + fleetWeight*running(d)*delta*prefill
 //	  > transferFixed + busy(s)*sourceWait + busy(d)*requeue
 //
 // with delta the cached-token advantage of the source over the computing
-// pod, and busy(x) true when pod x has at least BusyQueueThreshold requests
-// waiting. The two waits are constants of the busy state, not of queue
-// depth: a busy source delays the start of the transfer, and a busy
-// destination re-admits the pulled request through its waiting queue after
-// the blocks arrive.
+// pod, running(d) the requests running on the computing pod, and busy(x)
+// true when pod x has at least BusyQueueThreshold requests waiting. The
+// fleet term credits the prefill a pull keeps off a loaded pod: a recompute
+// there delays every running request's decode steps, while a pull delays
+// only the pulled request. A busy destination re-admits the pulled request
+// through its waiting queue after the blocks arrive.
 type CostModelConfig struct {
 	// PrefillMicrosecondsPerToken is the destination's prefill cost per token.
 	PrefillMicrosecondsPerToken float64 `json:"prefillMicrosecondsPerToken"`
@@ -90,13 +91,15 @@ type CostModelConfig struct {
 	TransferMicrosecondsPerToken float64 `json:"transferMicrosecondsPerToken"`
 	// TransferFixedMs is the fixed cost of a pull on idle pods.
 	TransferFixedMs float64 `json:"transferFixedMs,omitempty"`
-	// SourceWaitMs is added when the source is busy.
+	// SourceWaitMs is added when the source is busy. Pulls are served from
+	// the source's CPU tier, not its scheduler; leave it 0 unless a busy
+	// source is measured to delay pulls.
 	SourceWaitMs float64 `json:"sourceWaitMs,omitempty"`
 	// RequeueMs is added when the computing pod is busy.
 	RequeueMs float64 `json:"requeueMs,omitempty"`
-	// FleetWeight credits a pull on a busy computing pod with the prefill
-	// time it frees for the other requests there, at this weight. 0 decides
-	// on the pulled request's own latency only.
+	// FleetWeight credits a pull with the prefill time it frees for each
+	// request running on the computing pod, at this weight per running
+	// request. 0 decides on the pulled request's own latency only.
 	FleetWeight float64 `json:"fleetWeight,omitempty"`
 	// BusyQueueThreshold is the waiting-queue depth at or above which a pod
 	// counts as busy. Omitted or 0 defaults to 1; negative is rejected.
@@ -145,17 +148,17 @@ func (c *CostModelConfig) sourceCost(cached, maxCached, waitingQueue int) float6
 
 // evaluate returns the pull's gain and cost in milliseconds for a
 // delta-token pull between a source and computing pod with the given
-// waiting-queue depths.
-func (c *CostModelConfig) evaluate(delta, sourceWaiting, computingWaiting int) (gain, cost float64) {
+// waiting-queue depths and running-request count on the computing pod.
+func (c *CostModelConfig) evaluate(delta, sourceWaiting, computingWaiting, computingRunning int) (gain, cost float64) {
 	tokens := float64(delta)
 	gain = tokens * (c.PrefillMicrosecondsPerToken - c.TransferMicrosecondsPerToken) / 1000
+	gain += c.FleetWeight * float64(computingRunning) * tokens * c.PrefillMicrosecondsPerToken / 1000
 	cost = c.TransferFixedMs
 	if c.busy(sourceWaiting) {
 		cost += c.SourceWaitMs
 	}
 	if c.busy(computingWaiting) {
 		cost += c.RequeueMs
-		gain += c.FleetWeight * tokens * c.PrefillMicrosecondsPerToken / 1000
 	}
 	return gain, cost
 }
@@ -391,6 +394,14 @@ func waitingQueueSize(ep scheduling.Endpoint) int {
 	return m.WaitingQueueSize
 }
 
+func runningRequests(ep scheduling.Endpoint) int {
+	m := ep.GetMetrics()
+	if m == nil {
+		return 0
+	}
+	return m.RunningRequestsSize
+}
+
 // requestSpreadFraction maps a request ID onto [0, 1) so weighted source
 // sampling is uniform across requests while staying deterministic per
 // request.
@@ -408,6 +419,13 @@ func (p *Producer) PreRequest(ctx context.Context, request *scheduling.Inference
 	logger := log.FromContext(ctx).WithName(p.typedName.String()).V(logging.TRACE)
 	delete(request.Headers, routing.KVCacheSourceHeader)
 
+	// One line per request with the decision and its inputs, so pull behavior
+	// can be joined to request latency without TRACE-level log volume.
+	dlog := log.FromContext(ctx).WithName(p.typedName.String())
+	outcome := "no-best-match"
+	kv := []any{"requestID", request.RequestID}
+	defer func() { dlog.Info("p2p decision", append(kv, "outcome", outcome)...) }()
+
 	best, ok := scheduling.ReadRequestAttribute[*bestMatchPeer](request, p.attrKey())
 	if !ok {
 		logger.Info("no best-match peer stashed", "requestID", request.RequestID)
@@ -419,15 +437,20 @@ func (p *Producer) PreRequest(ctx context.Context, request *scheduling.Inference
 		computing = pr
 	}
 	if computing == nil || len(computing.TargetEndpoints) == 0 {
+		outcome = "no-endpoint"
 		return nil
 	}
 	endpoint := computing.TargetEndpoints[0]
 	md := endpoint.GetMetadata()
 	if md == nil {
+		outcome = "no-endpoint"
 		return nil
 	}
 	computingHostPort := net.JoinHostPort(md.Address, md.Port)
 	computingCached := p.cachedTokenCount(endpoint)
+	kv = append(kv, "best", best.hostPort, "bestCachedTokens", best.cachedTokens, "sourceWaiting", best.waitingQueue,
+		"computing", computingHostPort, "computingCachedTokens", computingCached, "computingWaiting", waitingQueueSize(endpoint),
+		"computingRunning", runningRequests(endpoint), "deltaTokens", best.cachedTokens-computingCached)
 	logger.Info("evaluating KV cache source",
 		"requestID", request.RequestID, "best", best.hostPort, "bestCachedTokens", best.cachedTokens,
 		"computing", computingHostPort, "computingCachedTokens", computingCached)
@@ -435,20 +458,26 @@ func (p *Producer) PreRequest(ctx context.Context, request *scheduling.Inference
 	// with the delta check below while minCachedTokenDelta >= 1 (a self-match
 	// is delta 0), but explicit against a future lower floor.
 	if best.hostPort == computingHostPort {
+		outcome = "self"
 		return nil
 	}
 	delta := best.cachedTokens - computingCached
 	if delta < p.minCachedTokenDelta {
+		outcome = "below-floor"
 		return nil
 	}
 	if p.costModel != nil {
-		gain, cost := p.costModel.evaluate(delta, best.waitingQueue, waitingQueueSize(endpoint))
+		gain, cost := p.costModel.evaluate(delta, best.waitingQueue, waitingQueueSize(endpoint), runningRequests(endpoint))
 		logger.Info("cost model", "requestID", request.RequestID, "deltaTokens", delta,
-			"sourceWaiting", best.waitingQueue, "computingWaiting", waitingQueueSize(endpoint), "gainMs", gain, "costMs", cost)
+			"sourceWaiting", best.waitingQueue, "computingWaiting", waitingQueueSize(endpoint),
+			"computingRunning", runningRequests(endpoint), "gainMs", gain, "costMs", cost)
+		kv = append(kv, "gainMs", gain, "costMs", cost)
 		if gain <= cost {
+			outcome = "declined"
 			return nil
 		}
 	}
+	outcome = "pulled"
 
 	if request.Headers == nil {
 		request.Headers = map[string]string{}

@@ -940,9 +940,44 @@ func TestPreRequest_CostModel_BusyQueueThreshold(t *testing.T) {
 	assert.Equal(t, "10.0.0.2:8080", req.Headers[routing.KVCacheSourceHeader])
 }
 
-// Fleet weight credits the destination's freed prefill: 32K on a busy
-// destination is 495 ms < 515 at w=0 (recompute) and 495 + 623 > 515 at w=1 (pull).
-func TestPreRequest_CostModel_FleetWeightFlipsDecision(t *testing.T) {
+// runningEndpoint builds a candidate with the given running-request count.
+func runningEndpoint(p *Producer, name, address string, running, waiting int) scheduling.Endpoint {
+	e := scheduling.NewEndpoint(&fwkdl.EndpointMetadata{
+		ID:      k8stypes.NamespacedName{Name: name},
+		Address: address,
+		Port:    "8080",
+	}, &fwkdl.Metrics{RunningRequestsSize: running, WaitingQueueSize: waiting}, nil)
+	e.Put(p.prefixMatchDataKey,
+		attrprefix.NewPrefixCacheMatchInfo(0, 4, testBlockSize).WithCachedBlockCount(0))
+	return e
+}
+
+// Fleet weight credits the prefill freed for each running request on the
+// computing pod, with or without a waiting queue. 512-token delta on an idle
+// queue with 2 running: gain 7.7 ms < 15 at w=0 (recompute) and
+// 7.7 + 2*512*19 us = 27.2 ms > 15 at w=1 (pull).
+func TestPreRequest_CostModel_FleetWeightScalesWithRunning(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	for _, tc := range []struct {
+		w       float64
+		running int
+		pull    bool
+	}{{0, 2, false}, {1, 2, true}, {1, 0, false}} {
+		cm := rigCostModel()
+		cm.FleetWeight = tc.w
+		p := New("test", Config{MinCachedTokenDelta: 1, CostModel: cm})
+
+		req := costRequest(p, "req-fleet", 512, 0)
+		_ = p.PreRequest(ctx, req, decodeOnly(runningEndpoint(p, "pod-a", "10.0.0.1", tc.running, 0)))
+
+		_, set := req.Headers[routing.KVCacheSourceHeader]
+		assert.Equal(t, tc.pull, set, "fleetWeight=%v running=%d", tc.w, tc.running)
+	}
+}
+
+// Busy destination: 8K with 4 running at w=1 gains 124 + 4*8192*19 us = 747 ms
+// > 15 + 500 requeue (pull); at w=0 it is 124 < 515 (recompute).
+func TestPreRequest_CostModel_FleetWeightOutweighsRequeue(t *testing.T) {
 	ctx := utils.NewTestContext(t)
 	for _, tc := range []struct {
 		w    float64
@@ -952,8 +987,8 @@ func TestPreRequest_CostModel_FleetWeightFlipsDecision(t *testing.T) {
 		cm.FleetWeight = tc.w
 		p := New("test", Config{MinCachedTokenDelta: 1, CostModel: cm})
 
-		req := costRequest(p, "req-fleet", 32768, 0)
-		_ = p.PreRequest(ctx, req, decodeOnly(queuedEndpoint(p, "pod-a", "10.0.0.1", 0, 1)))
+		req := costRequest(p, "req-fleet-busy", 8192, 0)
+		_ = p.PreRequest(ctx, req, decodeOnly(runningEndpoint(p, "pod-a", "10.0.0.1", 4, 1)))
 
 		_, set := req.Headers[routing.KVCacheSourceHeader]
 		assert.Equal(t, tc.pull, set, "fleetWeight=%v", tc.w)
