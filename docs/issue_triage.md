@@ -13,6 +13,8 @@ Every open issue carries either `needs-triage` or exactly one `triage/*` label. 
 
 `triage/*` labels are mutually exclusive. Applying one removes any other.
 
+`triage/accepted` requires at least one `kind/*` label and one `area/*` label on the issue. Without them, the workflow rejects `/triage accepted`, removes a `triage/accepted` label applied through the UI, and posts a comment that says what is needed. `/kind` and `/area` lines in the same comment as `/triage accepted` count.
+
 ## Comment commands
 
 Each command goes on its own line and starts at the first column. Commands inside code blocks and HTML comments are ignored. A command accepts several values separated by spaces, for example `/area epp scheduling`.

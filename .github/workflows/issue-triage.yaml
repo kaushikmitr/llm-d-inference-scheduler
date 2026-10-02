@@ -31,6 +31,10 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       ISSUE_NUMBER: ${{ github.event.issue.number }}
       REPO: ${{ github.repository }}
+      # Posted when triage/accepted is applied to an issue without the labels it needs.
+      ACCEPT_HINT: >-
+        @${{ github.event.sender.login }} `triage/accepted` needs at least one `kind/*`
+        label and one `area/*` label on the issue. Add them, then apply `triage/accepted` again.
     steps:
       - name: Apply comment commands
         id: commands
@@ -56,6 +60,11 @@ jobs:
             grep -E '^/((remove-)?(triage|kind|area)|(un)?assign)([[:space:]]|$)' || true)
           [ -z "$commands" ] && exit 0
 
+          # /triage runs last so that /kind and /area lines in the same comment count toward it.
+          others=$(grep -Ev '^/triage([[:space:]]|$)' <<< "$commands" || true)
+          triages=$(grep -E '^/triage([[:space:]]|$)' <<< "$commands" || true)
+          commands=$(printf '%s\n%s\n' "$others" "$triages" | sed '/^$/d')
+
           role=$(gh api "repos/$REPO/collaborators/$COMMENTER/permission" -q '.role_name' || true)
           privileged=false
           case "$role" in
@@ -70,6 +79,11 @@ jobs:
           reject() {
             echo "::warning::Rejected '$(esc "$1")': $2"
             rejected=$((rejected + 1))
+          }
+          has_kind_and_area() {
+            local labels
+            labels=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json labels -q '.labels[].name')
+            grep -q '^kind/' <<< "$labels" && grep -q '^area/' <<< "$labels"
           }
           is_assigned() {
             gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json assignees -q '.assignees[].login' | grep -qixF "$1"
@@ -124,6 +138,9 @@ jobs:
                   label="$prefix/$value"
                   if ! grep -qxF "$label" <<< "$existing"; then
                     reject "$cmd $value" "label does not exist"
+                  elif [ "$cmd $value" = "/triage accepted" ] && ! has_kind_and_area; then
+                    reject "$cmd $value" "issue needs a kind/* and an area/* label"
+                    gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body "$ACCEPT_HINT"
                   elif gh issue edit "$ISSUE_NUMBER" --repo "$REPO" "$flag" "$label"; then
                     applied=$((applied + 1))
                     if [ "$prefix" = triage ]; then
@@ -154,6 +171,15 @@ jobs:
           KEEP: ${{ steps.commands.outputs.keep || (github.event.action == 'labeled' && github.event.label.name) || '' }}
         run: |
           labels=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json labels -q '.labels[].name')
+
+          if [ "$KEEP" = triage/accepted ] && grep -qxF triage/accepted <<< "$labels" && \
+            ! { grep -q '^kind/' <<< "$labels" && grep -q '^area/' <<< "$labels"; }; then
+            gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label triage/accepted
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body "$ACCEPT_HINT"
+            labels=$(grep -vxF triage/accepted <<< "$labels" || true)
+            KEEP=
+          fi
+
           triage_labels=$(grep '^triage/' <<< "$labels" || true)
 
           if [ -n "$KEEP" ] && grep -qxF "$KEEP" <<< "$triage_labels"; then
