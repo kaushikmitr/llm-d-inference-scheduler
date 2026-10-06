@@ -65,11 +65,11 @@ jobs:
           triages=$(grep -E '^/triage([[:space:]]|$)' <<< "$commands" || true)
           commands=$(printf '%s\n%s\n' "$others" "$triages" | sed '/^$/d')
 
-          role=$(gh api "repos/$REPO/collaborators/$COMMENTER/permission" -q '.role_name' || true)
-          privileged=false
-          case "$role" in
-            admin|maintain|write|triage) privileged=true ;;
-          esac
+          # user.permissions holds the base permissions, so a custom repository role
+          # built on triage or higher passes. The top-level permission field reports
+          # triage as read, and role_name reports a custom role by its own name.
+          privileged=$(gh api "repos/$REPO/collaborators/$COMMENTER/permission" \
+            -q '.user.permissions | (.admin or .maintain or .push or .triage)' 2>/dev/null || echo false)
 
           existing=$(gh label list --repo "$REPO" --limit 200 --json name -q '.[].name')
           applied=0

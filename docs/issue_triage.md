@@ -48,5 +48,7 @@ For an issue without one:
 
 Only comments from assignees count as activity. Comments from other users and from bots do not. An assignee who has not commented is counted from the date of the assignment. A comment from an assignee after the reminder restarts the 30 days. The workflow does not close issues.
 
+The workflow reads the last 100 comments, the last 100 cross-references and the first 20 linked pull requests of an issue. An issue with more than that is skipped and named in the run log, so it is never unassigned on a partial view.
+
 This check is independent of `stale.yaml`, which marks issues stale after 90 days of inactivity from anyone.
 

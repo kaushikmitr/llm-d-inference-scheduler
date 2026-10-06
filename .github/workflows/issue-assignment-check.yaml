@@ -42,9 +42,10 @@ jobs:
                 number
                 createdAt
                 assignees(first: 10) { nodes { login } }
-                comments(last: 100) { nodes { author { login } body createdAt } }
-                closedByPullRequestsReferences(first: 20) { nodes { state } }
+                comments(last: 100) { totalCount nodes { author { login } body createdAt } }
+                closedByPullRequestsReferences(first: 20) { totalCount nodes { state } }
                 mentions: timelineItems(itemTypes: [CROSS_REFERENCED_EVENT], last: 100) {
+                  totalCount
                   nodes {
                     ... on CrossReferencedEvent {
                       source { ... on PullRequest { state author { login } } }
@@ -65,31 +66,43 @@ jobs:
           unassign_before=$(date -u -d "$DAYS_BEFORE_UNASSIGN days ago" +%Y-%m-%dT%H:%M:%SZ)
 
           # One line per issue that needs an action: <action> <number> <assignees>.
-          # $active is the latest comment by an assignee. An assignee who has not
-          # commented is counted from the assignment, so a new assignee gets the full period.
+          # An issue with more activity than one query page holds is skipped, so a
+          # decision is never made on a partial view. $active is the latest comment
+          # by an assignee. An assignee who has not commented is counted from the
+          # assignment, so a new assignee gets the full period.
           gh api graphql --paginate -f query="$QUERY" \
             -f q="repo:$REPO is:issue is:open assignee:*" \
             --jq '.data.search.nodes[]' |
             jq -r --arg marker "$MARKER" --arg remind "$remind_before" --arg unassign "$unassign_before" '
               (.assignees.nodes | map(.login)) as $users
               | .createdAt as $created
-              | select([.closedByPullRequestsReferences.nodes[] | select(.state == "OPEN")] | length == 0)
-              | select([.mentions.nodes[].source
-                        | select(.state == "OPEN" and (.author.login as $author | $users | index($author)))]
-                       | length == 0)
+              | (.comments.totalCount > 100 or .mentions.totalCount > 100
+                 or .closedByPullRequestsReferences.totalCount > 20) as $partial
+              | ([.closedByPullRequestsReferences.nodes[] | select(.state == "OPEN")] | length) as $linked
+              | ([.mentions.nodes[].source
+                  | select(.state == "OPEN" and (.author.login as $author | $users | index($author)))]
+                 | length) as $mentioned
+              | select($partial or ($linked == 0 and $mentioned == 0))
+              # The Actions bot is github-actions in GraphQL and github-actions[bot] in REST.
               | ([.comments.nodes[]
-                  | select(.author.login == "github-actions" and (.body | contains($marker)))
+                  | select((.author.login // "" | sub("\\[bot\\]$"; "")) == "github-actions"
+                           and (.body | contains($marker)))
                   | .createdAt] | max) as $reminder
               | ([.assigned.nodes[].createdAt,
                   (.comments.nodes[] | select(.author.login as $author | $users | index($author)) | .createdAt)]
                  | max // $created) as $active
-              | (if $reminder != null and $reminder > $active
+              | (if $partial then "skip"
+                 elif $reminder != null and $reminder > $active
                  then (if $reminder < $unassign then "unassign" else empty end)
                  elif $active < $remind then "remind"
                  else empty
                  end) as $action
               | "\($action) \(.number) \($users | join(","))"' |
             while read -r action number users; do
+              if [ "$action" = skip ]; then
+                echo "skip #$number ($users): more activity than the query reads, review it by hand"
+                continue
+              fi
               echo "$action #$number ($users)"
               [ "$DRY_RUN" = true ] && continue
               if [ "$action" = remind ]; then
