@@ -433,19 +433,22 @@ func requestSpreadFraction(requestID string) float64 {
 // minCachedTokenDelta tokens and, with a cost model configured, when the
 // pull's gain exceeds its cost. Any inbound value of the header is removed.
 func (p *Producer) PreRequest(ctx context.Context, request *scheduling.InferenceRequest, schedulingResult *scheduling.SchedulingResult) error {
-	logger := log.FromContext(ctx).WithName(p.typedName.String()).V(logging.TRACE)
 	routing.DeleteRoutingHeader(request.Headers, routing.KVCacheSourceHeader)
 
 	// One line per request with the decision and its inputs, so pull behavior
-	// can be joined to request latency without TRACE-level log volume.
-	dlog := log.FromContext(ctx).WithName(p.typedName.String())
+	// can be joined to request latency without TRACE-level log volume. The
+	// inputs are collected only when the line is enabled.
+	dlog := log.FromContext(ctx).WithName(p.typedName.String()).V(logging.DEFAULT)
+	logDecision := dlog.Enabled()
 	outcome := "no-best-match"
-	kv := []any{"requestID", request.RequestID}
-	defer func() { dlog.Info("p2p decision", append(kv, "outcome", outcome)...) }()
+	var kv []any
+	if logDecision {
+		kv = []any{"requestID", request.RequestID}
+		defer func() { dlog.Info("p2p decision", append(kv, "outcome", outcome)...) }()
+	}
 
 	best, ok := scheduling.ReadRequestAttribute[*bestMatchPeer](request, p.attrKey())
 	if !ok {
-		logger.Info("no best-match peer stashed", "requestID", request.RequestID)
 		return nil
 	}
 
@@ -465,12 +468,11 @@ func (p *Producer) PreRequest(ctx context.Context, request *scheduling.Inference
 	}
 	computingHostPort := net.JoinHostPort(md.Address, md.Port)
 	computingCached := p.cachedTokenCount(endpoint)
-	kv = append(kv, "best", best.hostPort, "bestCachedTokens", best.cachedTokens, "sourceWaiting", best.waitingQueue,
-		"computing", computingHostPort, "computingCachedTokens", computingCached, "computingWaiting", waitingQueueSize(endpoint),
-		"computingRunning", runningRequests(endpoint), "deltaTokens", best.cachedTokens-computingCached)
-	logger.Info("evaluating KV cache source",
-		"requestID", request.RequestID, "best", best.hostPort, "bestCachedTokens", best.cachedTokens,
-		"computing", computingHostPort, "computingCachedTokens", computingCached)
+	if logDecision {
+		kv = append(kv, "best", best.hostPort, "bestCachedTokens", best.cachedTokens, "sourceWaiting", best.waitingQueue,
+			"computing", computingHostPort, "computingCachedTokens", computingCached, "computingWaiting", waitingQueueSize(endpoint),
+			"computingRunning", runningRequests(endpoint), "deltaTokens", best.cachedTokens-computingCached)
+	}
 	// Never emit the header pointing at the computing pod itself. Redundant
 	// with the delta check below while minCachedTokenDelta >= 1 (a self-match
 	// is delta 0), but explicit against a future lower floor.
@@ -485,10 +487,9 @@ func (p *Producer) PreRequest(ctx context.Context, request *scheduling.Inference
 	}
 	if p.costModel != nil {
 		gain, cost := p.costModel.evaluate(delta, best.waitingQueue, waitingQueueSize(endpoint), runningRequests(endpoint))
-		logger.Info("cost model", "requestID", request.RequestID, "deltaTokens", delta,
-			"sourceWaiting", best.waitingQueue, "computingWaiting", waitingQueueSize(endpoint),
-			"computingRunning", runningRequests(endpoint), "gainMs", gain, "costMs", cost)
-		kv = append(kv, "gainMs", gain, "costMs", cost)
+		if logDecision {
+			kv = append(kv, "gainMs", gain, "costMs", cost)
+		}
 		if gain <= cost {
 			outcome = "declined"
 			return nil
@@ -500,7 +501,6 @@ func (p *Producer) PreRequest(ctx context.Context, request *scheduling.Inference
 		request.Headers = map[string]string{}
 	}
 	routing.SetRoutingHeader(request.Headers, routing.KVCacheSourceHeader, best.hostPort)
-	logger.Info("set KV cache source header", "requestID", request.RequestID, "value", best.hostPort)
 	return nil
 }
 

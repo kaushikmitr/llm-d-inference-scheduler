@@ -77,7 +77,9 @@ Parameters:
 | H200, pull over TCP | 33 | 16 | 400 | 400 | 0 |
 | B200, pull over RDMA | 19 | 10 | 200 | 125 | 0 |
 
-With `fleetWeight: 1`, a pod with a few requests running pulls any delta above the floor, and an idle pod pulls only deltas whose own prefill saving exceeds the fixed cost (about 23K tokens with the H200 values).
+With `fleetWeight: 1`, a pod with a few requests running pulls any delta above the floor, and an idle pod pulls only deltas whose own prefill saving exceeds the fixed cost (about 23.5K tokens with the H200 values).
+
+The [reusable prefix floor](#reusable-prefix-floor) is published in Produce from the source's cached prefix and `minCachedTokenDelta` alone; the cost model runs in PreRequest, after scheduling. A consumer such as `context-length-aware` can therefore plan prefill work around a pull the cost model declines: with the H200 values and an idle computing pod, every delta below about 23.5K tokens. When a consumer relies on the floor, set `minCachedTokenDelta` near the idle crossover, `transferFixedMs * 1000 / (prefillMicrosecondsPerToken - transferMicrosecondsPerToken)` tokens, so the floor and the decision agree on an idle pod.
 
 ```yaml
   - type: p2p-source-producer
