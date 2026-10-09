@@ -171,6 +171,8 @@ func (r *ExtProcServerRunner) SetupWithManager(mgr ctrl.Manager) error {
 				PoolGKNN:                 r.GKNN,
 				PriorityBandControlPlane: r.PriorityBandControlPlane,
 				RunOnNonLeaders:          runOnNonLeaders,
+				PrimaryV1:                r.ControllerCfg.hasV1InferenceObjective,
+				WatchV1Alpha2:            r.ControllerCfg.SecondaryObjectiveGV == inferenceAPIGV,
 			}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("failed setting up InferenceObjectiveReconciler - %w", err)
 			}
@@ -293,9 +295,12 @@ func (r *ExtProcServerRunner) AsRunnable(logger logr.Logger) manager.Runnable {
 	}))
 }
 
-// applyTLSOverrides sets MinVersion and CipherSuites on cfg when configured.
+// applyTLSOverrides sets MinVersion and CipherSuites on cfg. MinVersion is a
+// literal so gosec/CodeQL can resolve it statically; the configured value
+// applies only as an upgrade.
 func (r *ExtProcServerRunner) applyTLSOverrides(cfg *tls.Config) {
-	if r.TLSMinVersion != 0 {
+	cfg.MinVersion = tls.VersionTLS12
+	if r.TLSMinVersion > tls.VersionTLS12 {
 		cfg.MinVersion = r.TLSMinVersion
 	}
 	if len(r.TLSCipherSuites) > 0 {

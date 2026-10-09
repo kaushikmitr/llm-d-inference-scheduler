@@ -24,6 +24,7 @@ import (
 
 	errcommon "github.com/llm-d/llm-d-router/pkg/common/error"
 	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 )
 
@@ -41,6 +42,8 @@ var (
 		metadata.VideoFPSHeaderKey,
 		metadata.VideoDurationHeaderKey,
 		metadata.VideoResolutionHeaderKey,
+		metadata.AudioDurationHeaderKey,
+		metadata.AudioBytesPerSecondHeaderKey,
 		reqcommon.RevisionDecisionIDHeaderKey,
 	)
 
@@ -53,6 +56,17 @@ var (
 			metadata.FlowQueueDurationHeaderKey,
 		),
 		errcommon.RequestDroppedReasonHeaderKey,
+	)
+
+	// InternalRoutingHeaders carry worker addresses that the P/D sidecar connects to.
+	// Only EPP plugins may set them: client values are dropped on ingress and
+	// removed from the forwarded request when no plugin sets them. Deprecated
+	// aliases are included, so neither spelling can be supplied by a client.
+	InternalRoutingHeaders = routingHeaderNames(
+		routing.PrefillEndpointHeader,
+		routing.EncoderEndpointsHeader,
+		routing.DataParallelEndpointHeader,
+		routing.KVCacheSourceHeader,
 	)
 
 	// ProtocolHeaders are managed by the proxy layer (Envoy/EPP).
@@ -69,6 +83,14 @@ var (
 func IsSystemOwnedHeader(key string) bool {
 	k := strings.ToLower(key)
 	return InputControlHeaders.Has(k) || OutputInjectionHeaders.Has(k) || ProtocolHeaders.Has(k)
+}
+
+func routingHeaderNames(keys ...string) sets.Set[string] {
+	headers := sets.New[string]()
+	for _, key := range keys {
+		headers.Insert(routing.HeaderNames(key)...)
+	}
+	return headers
 }
 
 func lowerHeaderNames(keys ...string) sets.Set[string] {

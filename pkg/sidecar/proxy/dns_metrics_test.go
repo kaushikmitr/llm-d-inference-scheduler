@@ -118,7 +118,7 @@ func TestServeMetrics_BindsMetricsPort(t *testing.T) {
 }
 
 func TestServeMetrics_ListenError(t *testing.T) {
-	held, err := net.Listen("tcp", ":0")
+	held, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = held.Close() })
 
@@ -148,7 +148,7 @@ func TestServeMetrics_TLS(t *testing.T) {
 	addr := ln.Addr().String()
 	client := &http.Client{
 		Timeout:   2 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, //nolint:gosec // self-signed test cert
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, //#nosec -- self-signed test cert
 	}
 	require.Eventually(t, func() bool {
 		resp, err := client.Get("https://" + addr + "/metrics")

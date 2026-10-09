@@ -255,8 +255,12 @@ func writeResult(w http.ResponseWriter, res *api.ResultMessage) error {
 			return nil
 		}
 		w.Header().Set("Content-Type", "application/json")
+		// The upstream body is written verbatim without re-encoding; block
+		// MIME-sniffing so a client cannot reinterpret it as HTML and run
+		// script content it may contain.
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.WriteHeader(res.StatusCode)
-		_, err := w.Write([]byte(res.Payload))
+		_, err := w.Write([]byte(res.Payload)) //#nosec G705 -- served as application/json with nosniff
 		return err
 	}
 	switch res.ErrorCode {

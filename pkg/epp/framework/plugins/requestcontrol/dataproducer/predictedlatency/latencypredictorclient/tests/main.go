@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"math"
 	"math/rand/v2"
@@ -33,6 +34,9 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/predictedlatency/latencypredictorclient"
 	"golang.org/x/time/rate"
 )
+
+// testRunningMarker is the liveness file created at startup and removed on every exit path.
+const testRunningMarker = "/tmp/test_running"
 
 type TestMetrics struct {
 	TotalRequests         int64
@@ -88,7 +92,7 @@ func main() {
 	coalesceWindowMs := parseEnvInt("COALESCE_WINDOW_MS", 5)
 	maxCoalescedCallers := parseEnvInt("MAX_COALESCED_CALLERS", 50)
 
-	if err := os.WriteFile("/tmp/test_running", []byte("running"), 0644); err != nil {
+	if err := writeTestRunningMarker(testRunningMarker); err != nil {
 		log.Printf("Warning: could not create test_running marker: %v", err)
 	}
 	// Removed defer — cleaned up explicitly before all exit points to satisfy gocritic.
@@ -127,7 +131,7 @@ func main() {
 
 	if err := predictor.Start(testCtx); err != nil {
 		cancel()
-		os.Remove("/tmp/test_running")
+		os.Remove(testRunningMarker)
 		logger.Error(err, "Failed to start predictor")
 		return
 	}
@@ -418,17 +422,17 @@ func main() {
 
 	if failedReq > 0 {
 		logger.Info("WARNING: Test had failed prediction requests", "failed_count", failedReq)
-		os.Remove("/tmp/test_running")
+		os.Remove(testRunningMarker)
 		os.Exit(1)
 	}
 
-	os.Remove("/tmp/test_running")
+	os.Remove(testRunningMarker)
 	logger.Info("Test completed successfully!")
 }
 
 // generateTrainingBatch creates a batch of realistic training entries.
 //
-//nolint:gosec // G404: math/rand/v2 is non-cryptographic PRNG used only for test fixture values
+// #nosec G404 -- math/rand/v2 is non-cryptographic PRNG used only for test fixture values
 func generateTrainingBatch(batchSize int) []latencypredictorclient.TrainingEntry {
 	entries := make([]latencypredictorclient.TrainingEntry, batchSize)
 
@@ -512,6 +516,30 @@ func generateTrainingBatch(batchSize int) []latencypredictorclient.TrainingEntry
 	return entries
 }
 
+// writeTestRunningMarker creates path with O_EXCL, which fails when path is an existing symlink.
+// A stale entry is removed and the exclusive create is retried once.
+func writeTestRunningMarker(path string) error {
+	f, err := openExclusive(path)
+	if errors.Is(err, os.ErrExist) {
+		if rmErr := os.Remove(path); rmErr != nil {
+			return rmErr
+		}
+		f, err = openExclusive(path)
+	}
+	if err != nil {
+		return err
+	}
+	_, err = f.Write([]byte("running"))
+	if err1 := f.Close(); err1 != nil && err == nil {
+		err = err1
+	}
+	return err
+}
+
+func openExclusive(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644) //#nosec G302 G304 -- path is the fixed marker or a unit-test temp path; file mode is per-process, not a credential
+}
+
 // parseEnvInt reads an integer environment variable, logging a warning on parse
 // failure, and returns the default value when the variable is unset or invalid.
 func parseEnvInt(key string, defaultVal int) int {
@@ -521,7 +549,7 @@ func parseEnvInt(key string, defaultVal int) int {
 	}
 	val, err := strconv.Atoi(raw)
 	if err != nil {
-		log.Printf("Warning: invalid value %q for %s, using default %d", raw, key, defaultVal) //nolint:gosec // %q escapes control chars in env-var value; operator-supplied
+		log.Printf("Warning: invalid value %q for %s, using default %d", raw, key, defaultVal) //#nosec -- %q escapes control chars in env-var value; operator-supplied
 		return defaultVal
 	}
 	if val == 0 {
