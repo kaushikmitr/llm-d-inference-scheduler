@@ -30,6 +30,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/llm-d/llm-d-router/pkg/kvtier/peer"
 	"github.com/llm-d/llm-d-router/pkg/kvtier/policy"
 	"github.com/llm-d/llm-d-router/pkg/kvtier/pool"
 	"github.com/llm-d/llm-d-router/pkg/kvtier/server"
@@ -47,6 +48,11 @@ func main() {
 		logLevel    = flag.String("log-level", "info", "debug, info, warn or error")
 		grace       = flag.Duration("release-grace", server.DefaultReleaseGrace,
 			"how long a disconnected client's pins and half-written slots are held before reuse")
+		peerListen = flag.String("peer-listen", ":9401", "TCP address for other daemons; empty disables peer transfer")
+		peerAdvert = flag.String("peer-endpoint", "",
+			"endpoint other daemons and routers use for this daemon, e.g. tcp://10.0.0.5:9401; defaults to the listen address")
+		peerTimeout = flag.Duration("peer-timeout", 30*time.Second, "time limit for one peer transfer")
+		peerStreams = flag.Int("peer-streams", 8, "TCP connections one fetch spreads its blocks over")
 	)
 	flag.Parse()
 
@@ -82,6 +88,21 @@ func main() {
 
 	srv := server.New(store, log)
 	srv.SetReleaseGrace(*grace)
+	var node *peer.Node
+	if *peerListen != "" {
+		node = peer.New(store, srv, log, peer.Options{
+			ListenAddr: *peerListen,
+			Endpoint:   *peerAdvert,
+			Timeout:    *peerTimeout,
+			Streams:    *peerStreams,
+		})
+		if err := node.Listen(); err != nil {
+			log.Error("peer listen", "addr", *peerListen, "err", err)
+			os.Exit(1)
+		}
+		srv.SetPeer(node)
+		log.Info("peer transfer enabled", "listen", node.Addr().String(), "endpoint", node.Endpoint())
+	}
 	if err := srv.Listen(*socket); err != nil {
 		log.Error("listen", "socket", *socket, "err", err)
 		os.Exit(1)
@@ -95,7 +116,7 @@ func main() {
 				log.Debug("healthz write", "err", err)
 			}
 		})
-		mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) { writeMetrics(w, store, srv) })
+		mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) { writeMetrics(w, store, srv, node) })
 		go func() {
 			metricsServer := &http.Server{Addr: *metricsAddr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 			if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -109,6 +130,9 @@ func main() {
 	go func() {
 		<-sig
 		log.Info("shutting down")
+		if node != nil {
+			node.Close()
+		}
 		srv.Close()
 	}()
 	if err := srv.Serve(); err != nil {
@@ -118,7 +142,7 @@ func main() {
 	os.Remove(*socket)
 }
 
-func writeMetrics(w http.ResponseWriter, store *pool.Store, srv *server.Server) {
+func writeMetrics(w http.ResponseWriter, store *pool.Store, srv *server.Server, node *peer.Node) {
 	st := store.Stats()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	gauge := func(name, help string, v any) {
@@ -139,6 +163,12 @@ func writeMetrics(w http.ResponseWriter, store *pool.Store, srv *server.Server) 
 	counter("kvtierd_loads_total", "Blocks pinned for a load.", st.Loads)
 	counter("kvtierd_load_misses_total", "Blocks requested for a load but absent.", st.LoadMisses)
 	counter("kvtierd_evictions_total", "Blocks evicted.", st.Evictions)
+	if node != nil {
+		counter("kvtierd_peer_blocks_fetched_total", "Blocks pulled from other daemons.", node.Fetched.Load())
+		counter("kvtierd_peer_blocks_served_total", "Blocks sent to other daemons.", node.Served.Load())
+		counter("kvtierd_peer_bytes_in_total", "Bytes pulled from other daemons.", node.BytesIn.Load())
+		counter("kvtierd_peer_bytes_out_total", "Bytes sent to other daemons.", node.BytesOut.Load())
+	}
 }
 
 // parseBytes parses sizes such as 512GiB, 64G, 1048576.

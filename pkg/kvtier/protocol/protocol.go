@@ -43,6 +43,23 @@ const (
 	OpSnapshot = "snapshot"
 	OpStats    = "stats"
 	OpEvent    = "event"
+
+	// Local requests that move blocks between daemons.
+	OpFetch = "fetch" // pull keys from a peer into this daemon's pool
+	OpPush  = "push"  // ask a peer to pull blocks, named by router hash, from us
+
+	// Requests between daemons, over TCP.
+	OpPeerGet   = "peer_get"   // send these blocks; raw block bytes follow the response
+	OpPeerOffer = "peer_offer" // please pull these keys from the named endpoint
+)
+
+// Per-key outcome of a fetch.
+const (
+	FetchOK      uint8 = 0 // pulled into the pool
+	FetchPresent uint8 = 1 // already in the pool
+	FetchMissing uint8 = 2 // the source does not have it
+	FetchNoSpace uint8 = 3 // no free or evictable slot here
+	FetchFailed  uint8 = 4 // transfer error
 )
 
 // Message is the single envelope for every request, response and event.
@@ -61,6 +78,8 @@ type Message struct {
 	ArenaBytes uint64 `msgpack:"arena_bytes,omitempty"`
 	NumSlots   int64  `msgpack:"num_slots,omitempty"`
 	Session    uint64 `msgpack:"session,omitempty"`
+	// SelfEndpoint is this daemon's advertised peer endpoint, if any.
+	SelfEndpoint string `msgpack:"self_endpoint,omitempty"`
 
 	// alloc, commit, pin, unpin, snapshot
 	Keys   [][]byte `msgpack:"keys,omitempty"`
@@ -71,6 +90,12 @@ type Message struct {
 	// event, and the evictions caused by alloc
 	Stored  [][]byte `msgpack:"stored,omitempty"`
 	Removed [][]byte `msgpack:"removed,omitempty"`
+
+	// fetch, push, peer_get, peer_offer
+	Endpoint string            `msgpack:"endpoint,omitempty"` // the peer to pull from or offer to
+	Hashes   []uint64          `msgpack:"hashes,omitempty"`   // router hashes (push)
+	Evict    bool              `msgpack:"evict,omitempty"`    // the source drops what it sends
+	Failures map[uint64]string `msgpack:"failures,omitempty"` // push: hash -> reason
 
 	// stats
 	Stats map[string]any `msgpack:"stats,omitempty"`

@@ -50,6 +50,7 @@ import time
 from collections import deque
 from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -68,8 +69,11 @@ from vllm.v1.kv_offload.tiering.base import (
     TransferJob,
 )
 
+from llmd_kv_tiering import hints as kvhints
 from llmd_kv_tiering.client import (
     ALLOCATED,
+    FETCH_OK,
+    FETCH_PRESENT,
     NO_SPACE,
     DaemonClient,
     DaemonError,
@@ -124,6 +128,24 @@ def derive_namespace(offloading_spec: OffloadingSpec, block_size_bytes: int, sal
     return f"{cfg.model.name}:{digest[:16]}"
 
 
+@dataclass
+class _RequestHints:
+    """The fetch hints of one request."""
+
+    by_hash: dict[int, kvhints.Hint] = field(default_factory=dict)
+    # A plain kv.fetch hint that makes every block of the request fetchable,
+    # whatever hashes it lists (opportunistic query).
+    opportunistic: kvhints.Hint | None = None
+    # Blocks a source did not have, so they are not reported again.
+    missing: set[bytes] = field(default_factory=set)
+
+    def source_for(self, key: OffloadKey) -> kvhints.Hint | None:
+        if key in self.missing:
+            return None
+        hint = self.by_hash.get(kvhints.router_hash(key))
+        return hint if hint is not None else self.opportunistic
+
+
 class LLMDKVTierManager(SecondaryTierManager):
     """Secondary tier whose blocks live in the node's kvtierd pool."""
 
@@ -146,6 +168,7 @@ class LLMDKVTierManager(SecondaryTierManager):
         reconnect_interval_s: float = 1.0,
         locality: str | None = None,
         enable_kv_events: bool = True,
+        opportunistic_query: bool = True,
     ) -> None:
         super().__init__(
             offloading_spec=offloading_spec,
@@ -158,6 +181,11 @@ class LLMDKVTierManager(SecondaryTierManager):
         self._namespace = namespace or derive_namespace(offloading_spec, self.block_size_bytes, namespace_salt)
         self._timeout = timeout_s
         self._reconnect_interval = reconnect_interval_s
+        # A plain kv.fetch hint covers every block of its request, not only
+        # the hashes it lists. Routers rely on this because 64-bit hashes do
+        # not survive vLLM's gRPC hint path (a protobuf Struct number is a
+        # double).
+        self._opportunistic = opportunistic_query
         self._client_name = f"vllm/{socket.gethostname()}/{os.getpid()}"
 
         # Address of the primary tier's first byte. Keep the array alive.
@@ -198,6 +226,11 @@ class LLMDKVTierManager(SecondaryTierManager):
         self._copy_threads = max(1, num_copy_threads)
         self._inflight: dict[int, Future] = {}
         self._finished: deque[JobResult] = deque()
+
+        # Fetch hints per request. Written on the scheduler thread; load jobs
+        # get a reference at submit time.
+        self._req_fetch: dict[str, _RequestHints] = {}
+        self._self_endpoint: str | None = None
 
         self._try_connect()
         self._reconnector = threading.Thread(target=self._reconnect_loop, name="llmd-kv-tiering-connect", daemon=True)
@@ -254,6 +287,7 @@ class LLMDKVTierManager(SecondaryTierManager):
                 logger.warning("kvtierd connection dropped while connecting")
                 return False
             self._client = client
+            self._self_endpoint = client.self_endpoint
             self._mirror.update(snapshot)
         self._emit(snapshot, removed=False)
         # The snapshot already reflects events received before its reply.
@@ -335,13 +369,19 @@ class LLMDKVTierManager(SecondaryTierManager):
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         if key in self._mirror:
             return LookupResult.HIT
+        # A router fetch hint makes the block fetchable from a peer. Report
+        # it as a hit; the load pulls it.
+        hints = self._req_fetch.get(req_context.req_id)
+        if hints is not None and self._client is not None and hints.source_for(key):
+            return LookupResult.HIT
         return LookupResult.MISS
 
     def submit_store(self, job_metadata: TransferJob) -> None:
         self._submit(job_metadata, self._run_store)
 
     def submit_load(self, job_metadata: TransferJob) -> None:
-        self._submit(job_metadata, self._run_load)
+        hints = self._req_fetch.get(job_metadata.req_context.req_id)
+        self._submit(job_metadata, lambda job: self._run_load(job, hints))
 
     def _submit(self, job: TransferJob, fn) -> None:
         assert len(job.keys) == len(job.chunk_ids), "keys and chunk_ids differ"
@@ -427,11 +467,61 @@ class LLMDKVTierManager(SecondaryTierManager):
             transfer_bytes=len(committed) * size,
         )
 
-    def _run_load(self, job: TransferJob) -> JobResult:
+    def _fetch_hinted(
+        self,
+        client: DaemonClient,
+        keys: list[OffloadKey],
+        hints: _RequestHints | None,
+    ) -> None:
+        """Pull hinted blocks that are not local from their source daemons."""
+        if hints is None:
+            return
+        groups: dict[tuple[str, bool], list[OffloadKey]] = {}
+        for key in keys:
+            if key in self._mirror:
+                continue
+            hint = hints.source_for(key)
+            if hint is None:
+                continue
+            groups.setdefault((hint.endpoint, hint.evict_source), []).append(key)
+        for (endpoint, evict), group in groups.items():
+            try:
+                status = client.call("fetch", keys=group, endpoint=endpoint, evict=evict)["status"]
+            except DaemonError as e:
+                logger.warning("fetch of %d blocks from %s failed: %s", len(group), endpoint, e)
+                hints.missing.update(group)
+                continue
+            # The daemon's stored events, which arrive before this reply,
+            # add the fetched blocks to the mirror.
+            got = [k for k, st in zip(group, status) if st in (FETCH_OK, FETCH_PRESENT)]
+            hints.missing.update(k for k, st in zip(group, status) if st not in (FETCH_OK, FETCH_PRESENT))
+            if len(got) < len(group):
+                logger.debug("fetched %d of %d hinted blocks from %s", len(got), len(group), endpoint)
+
+    def _run_push(self, hint: kvhints.Hint) -> None:
+        client = self._current()
+        if client is None:
+            return
+        try:
+            resp = client.call(
+                "push",
+                hashes=sorted(hint.block_hashes),
+                endpoint=hint.endpoint,
+                evict=hint.evict_source,
+            )
+        except DaemonError as e:
+            logger.warning("%s %s to %s failed: %s", hint.action_type, hint.action_id, hint.endpoint, e)
+            return
+        if failures := resp.get("failures"):
+            logger.debug("%s %s: %d hashes failed", hint.action_type, hint.action_id, len(failures))
+
+    def _run_load(self, job: TransferJob, hints: _RequestHints | None = None) -> JobResult:
         client = self._current()
         if client is None:
             return JobResult(job_id=job.job_id, success=False)
         keys = list(job.keys)
+        t0 = time.monotonic()
+        self._fetch_hinted(client, keys, hints)
         t1 = time.monotonic()
         slots = client.call("pin", keys=keys)["slots"]
         t2 = time.monotonic()
@@ -454,11 +544,12 @@ class LLMDKVTierManager(SecondaryTierManager):
         t3 = time.monotonic()
         size = self.block_size_bytes
         logger.debug(
-            "load job %d: %d/%d blocks, %.1f MB; pin %.1f ms, copy %.1f ms",
+            "load job %d: %d/%d blocks, %.1f MB; fetch %.1f ms, pin %.1f ms, copy %.1f ms",
             job.job_id,
             len(loaded),
             len(keys),
             len(loaded) * size / 1e6,
+            (t1 - t0) * 1e3,
             (t2 - t1) * 1e3,
             (t3 - t2) * 1e3,
         )
@@ -489,7 +580,36 @@ class LLMDKVTierManager(SecondaryTierManager):
         return events
 
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
+        envelope = kvhints.envelope_from_request(req_context.kv_hints, req_context.kv_transfer_params)
+        if envelope is None:
+            return RequestOffloadingContext()
+        parsed = kvhints.parse(envelope)
+        hints = _RequestHints()
+        for hint in parsed.fetches:
+            if self._is_self(hint.endpoint):
+                continue  # the blocks are in this node's pool or nowhere
+            # The first hint that names a hash wins.
+            for h in hint.block_hashes:
+                hints.by_hash.setdefault(h, hint)
+            # Evict-on-fetch stays limited to the hashes it names.
+            if self._opportunistic and not hint.evict_source and hints.opportunistic is None:
+                hints.opportunistic = hint
+        if hints.by_hash or hints.opportunistic:
+            self._req_fetch[req_context.req_id] = hints
+        for hint in parsed.pushes:
+            # Prefetch and move run on their own, apart from this request.
+            self._executor.submit(self._run_push, hint)
         return RequestOffloadingContext()
+
+    def on_request_finished(self, req_context: ReqContext) -> None:
+        self._req_fetch.pop(req_context.req_id, None)
+
+    def _is_self(self, endpoint: str) -> bool:
+        own = self._self_endpoint
+        if not own:
+            return False
+        strip = lambda e: e.removeprefix("tcp://")  # noqa: E731
+        return strip(endpoint) == strip(own)
 
     def drain_jobs(self) -> None:
         pending = list(self._inflight.values())
@@ -514,3 +634,8 @@ class LLMDKVTierManager(SecondaryTierManager):
     @property
     def namespace(self) -> str:
         return self._namespace
+
+    @property
+    def endpoint(self) -> str | None:
+        """This node's daemon endpoint, for routers to name in hints."""
+        return self._self_endpoint

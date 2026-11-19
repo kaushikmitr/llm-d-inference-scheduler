@@ -52,6 +52,12 @@ NO_SPACE = 2
 # too late. The client then closes the connection, so the daemon drops
 # whatever the session held, after its release grace period.
 READ_ONLY_OPS = frozenset({"snapshot", "stats"})
+# Per-key outcome of a fetch from a peer daemon.
+FETCH_OK = 0
+FETCH_PRESENT = 1
+FETCH_MISSING = 2
+FETCH_NO_SPACE = 3
+FETCH_FAILED = 4
 
 _encoder = msgspec.msgpack.Encoder()
 _decoder = msgspec.msgpack.Decoder(dict)
@@ -127,6 +133,9 @@ class DaemonClient:
         self.session = hello["session"]
         self.arena: Arena = hello["arena"]
         self.num_slots: int = hello["num_slots"]
+        # The daemon's peer endpoint, which routers name in hints. None when
+        # the daemon has peer transfer disabled.
+        self.self_endpoint: str | None = hello.get("self_endpoint") or None
         self._reader = threading.Thread(
             target=self._read_loop,
             args=(leftover,),

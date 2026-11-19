@@ -16,6 +16,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -28,6 +29,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/llm-d/llm-d-router/pkg/kvtier/peer"
 	"github.com/llm-d/llm-d-router/pkg/kvtier/pool"
 	"github.com/llm-d/llm-d-router/pkg/kvtier/protocol"
 )
@@ -51,6 +53,7 @@ const DefaultReleaseGrace = 10 * time.Second
 type Server struct {
 	store *pool.Store
 	log   *slog.Logger
+	peer  *peer.Node // nil when peer transfer is disabled
 
 	nextID   atomic.Uint64
 	mu       sync.Mutex
@@ -117,6 +120,26 @@ func New(store *pool.Store, log *slog.Logger) *Server {
 // SetReleaseGrace sets how long a disconnected session's pins and
 // half-written slots are held before reuse. Call it before Serve.
 func (s *Server) SetReleaseGrace(d time.Duration) { s.grace = d }
+
+// SetPeer enables fetch and push through node.
+func (s *Server) SetPeer(node *peer.Node) { s.peer = node }
+
+// Ordered runs fn under the lock that orders pool changes and their events.
+// A pool change and the Announce calls for it must run inside one Ordered
+// call. It implements peer.Notifier.
+func (s *Server) Ordered(fn func()) {
+	s.order.Lock()
+	defer s.order.Unlock()
+	fn()
+}
+
+// AnnounceStored tells every session in ns that blocks became loadable.
+// Call it inside Ordered. It implements peer.Notifier.
+func (s *Server) AnnounceStored(ns string, refs []pool.KeyRef) { s.broadcastStored(ns, refs) }
+
+// AnnounceRemoved tells every session which of its blocks were removed.
+// Call it inside Ordered. It implements peer.Notifier.
+func (s *Server) AnnounceRemoved(refs []pool.KeyRef) { s.broadcastRemoved(refs) }
 
 // Listen binds the Unix socket at path, replacing a stale socket file.
 func (s *Server) Listen(path string) error {
@@ -247,6 +270,12 @@ func (s *Server) handle(conn *net.UnixConn) {
 			}
 			return
 		}
+		if req.Op == protocol.OpFetch || req.Op == protocol.OpPush {
+			// These wait on the network; do not hold up the session's other
+			// requests.
+			go s.reply(ss, s.dispatch(ss, req))
+			continue
+		}
 		if !s.dispatchAndReply(ss, req) {
 			return
 		}
@@ -327,6 +356,9 @@ func (s *Server) hello(ss *session) error {
 	resp.ArenaBytes = arena.Size()
 	resp.NumSlots = arena.NumSlots()
 	resp.SlotBytes = arena.SlotBytes()
+	if s.peer != nil {
+		resp.SelfEndpoint = s.peer.Endpoint()
+	}
 	frame, err := protocol.Encode(resp)
 	if err != nil {
 		return err
@@ -381,6 +413,44 @@ func (s *Server) dispatch(ss *session, req *protocol.Message) *protocol.Message 
 		s.store.Unpin(ss.id, ss.ns, req.Keys)
 	case protocol.OpSnapshot:
 		resp.Keys = s.store.Snapshot(ss.ns)
+	case protocol.OpFetch:
+		if s.peer == nil {
+			resp.Error = "peer transfer is disabled on this daemon"
+			break
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		status, err := s.peer.Fetch(ctx, req.Endpoint, ss.ns, req.Keys, req.Evict)
+		resp.Status = status
+		if err != nil {
+			s.log.Warn("fetch failed", "source", req.Endpoint, "err", err)
+			if status == nil {
+				resp.Error = err.Error()
+			}
+		}
+	case protocol.OpPush:
+		if s.peer == nil {
+			resp.Error = "peer transfer is disabled on this daemon"
+			break
+		}
+		found := s.store.Resolve(ss.ns, req.Hashes)
+		var keys [][]byte
+		for _, h := range req.Hashes {
+			ks, ok := found[h]
+			if !ok {
+				if resp.Failures == nil {
+					resp.Failures = map[uint64]string{}
+				}
+				resp.Failures[h] = "not_found"
+				continue
+			}
+			keys = append(keys, ks...)
+		}
+		if len(keys) > 0 {
+			if err := s.peer.Offer(context.Background(), req.Endpoint, ss.ns, keys, req.Evict); err != nil {
+				resp.Error = err.Error()
+			}
+		}
 	case protocol.OpStats:
 		st := s.store.Stats()
 		resp.Stats = map[string]any{

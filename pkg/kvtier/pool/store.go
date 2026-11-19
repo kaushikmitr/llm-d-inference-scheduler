@@ -88,6 +88,7 @@ type Store struct {
 	free     []int64
 	bySlot   []*entry
 	byKey    map[string]*entry
+	byHash   map[hashKey]map[*entry]struct{} // loadable blocks by router hash
 	pol      policy.Policy
 	sessions map[SessionID]map[string]struct{} // keys pinned or written by a session
 	stats    Stats
@@ -104,6 +105,7 @@ func NewStore(opts ArenaOptions, newPolicy func() policy.Policy) *Store {
 		opts:     opts,
 		newPol:   newPolicy,
 		byKey:    make(map[string]*entry),
+		byHash:   make(map[hashKey]map[*entry]struct{}),
 		sessions: make(map[SessionID]map[string]struct{}),
 	}
 }
@@ -147,6 +149,39 @@ func (s *Store) Arena() *Arena {
 	return s.arena
 }
 
+type hashKey struct {
+	ns string
+	h  uint64
+}
+
+func (s *Store) indexHash(e *entry) {
+	h, ok := RouterHash(e.key)
+	if !ok {
+		return
+	}
+	hk := hashKey{e.ns, h}
+	m := s.byHash[hk]
+	if m == nil {
+		m = make(map[*entry]struct{})
+		s.byHash[hk] = m
+	}
+	m[e] = struct{}{}
+}
+
+func (s *Store) unindexHash(e *entry) {
+	h, ok := RouterHash(e.key)
+	if !ok {
+		return
+	}
+	hk := hashKey{e.ns, h}
+	if m := s.byHash[hk]; m != nil {
+		delete(m, e)
+		if len(m) == 0 {
+			delete(s.byHash, hk)
+		}
+	}
+}
+
 func mapKey(ns string, key []byte) string {
 	return ns + "\x00" + string(key)
 }
@@ -182,6 +217,7 @@ func (s *Store) takeSlot(evicted *[]KeyRef) (int64, bool) {
 		return 0, false
 	}
 	e := s.bySlot[victim]
+	s.unindexHash(e)
 	s.pol.Remove(victim)
 	delete(s.byKey, mapKey(e.ns, e.key))
 	s.bySlot[victim] = nil
@@ -254,6 +290,7 @@ func (s *Store) Commit(sid SessionID, ns string, keys [][]byte, ok []bool) ([]Ke
 		}
 		e.state = ready
 		e.owner = 0
+		s.indexHash(e)
 		s.pol.Insert(e.slot)
 		s.stats.Stores++
 		stored = append(stored, KeyRef{Namespace: ns, Key: e.key})
@@ -303,6 +340,69 @@ func (s *Store) Unpin(sid SessionID, ns string, keys [][]byte) {
 			s.untrack(sid, mk)
 		}
 	}
+}
+
+// RouterHash returns the 64-bit hash a router uses for a vLLM offload key:
+// the low 64 bits of the block hash, which is the key minus its trailing
+// 4-byte group index. It matches vLLM's maybe_convert_block_hash.
+func RouterHash(key []byte) (uint64, bool) {
+	if len(key) < 4 {
+		return 0, false
+	}
+	bh := key[:len(key)-4]
+	var h uint64
+	start := 0
+	if len(bh) > 8 {
+		start = len(bh) - 8
+	}
+	for _, b := range bh[start:] {
+		h = h<<8 | uint64(b)
+	}
+	return h, true
+}
+
+// Resolve maps router hashes to the keys of loadable blocks in ns. A hash
+// with no block is absent from the result. A hash can map to several keys,
+// one per KV cache group.
+func (s *Store) Resolve(ns string, hashes []uint64) map[uint64][][]byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[uint64][][]byte)
+	for _, h := range hashes {
+		for e := range s.byHash[hashKey{ns, h}] {
+			out[h] = append(out[h], e.key)
+		}
+	}
+	return out
+}
+
+// Remove deletes loadable, unpinned blocks. Blocks that are pinned or still
+// being written are kept. Returns the blocks removed.
+func (s *Store) Remove(ns string, keys [][]byte) []KeyRef {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var removed []KeyRef
+	for _, k := range keys {
+		mk := mapKey(ns, k)
+		e, ok := s.byKey[mk]
+		if !ok || e.state != ready || e.pinned() {
+			continue
+		}
+		s.unindexHash(e)
+		s.pol.Remove(e.slot)
+		delete(s.byKey, mk)
+		s.freeSlot(e.slot)
+		removed = append(removed, KeyRef{Namespace: ns, Key: e.key})
+	}
+	return removed
+}
+
+// Has reports whether a loadable block exists.
+func (s *Store) Has(ns string, key []byte) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.byKey[mapKey(ns, key)]
+	return ok && e.state == ready
 }
 
 // Snapshot returns the keys of every loadable block in a namespace.

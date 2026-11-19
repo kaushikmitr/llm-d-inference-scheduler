@@ -55,6 +55,8 @@ class Daemon:
                 str(self.slots * BLOCK),
                 "--metrics-addr",
                 "",
+                "--peer-listen",
+                "127.0.0.1:0",
                 "--log-level",
                 "warn",
             ]
