@@ -61,6 +61,11 @@ type Options struct {
 	// Streams is the number of TCP connections one fetch spreads its
 	// blocks over.
 	Streams int
+	// RDMAHelperSocket is the Unix socket of this node's RDMA helper. When
+	// set, fetches read blocks from the source pool with RDMA, and this
+	// daemon serves its pool to peers that ask for RDMA. Empty means TCP
+	// only.
+	RDMAHelperSocket string
 }
 
 // Node is one daemon's peer endpoint: a server for other daemons and a
@@ -85,6 +90,8 @@ type Node struct {
 	BytesOut atomic.Uint64
 	Fetched  atomic.Uint64
 	Served   atomic.Uint64
+
+	rdma *RDMAHelper // nil when RDMA is off
 }
 
 // New returns a node. Call Listen to accept peers.
@@ -98,7 +105,7 @@ func New(store *pool.Store, notify Notifier, log *slog.Logger, opts Options) *No
 	if opts.MaxIdleConns < opts.Streams {
 		opts.MaxIdleConns = opts.Streams
 	}
-	return &Node{
+	node := &Node{
 		store:  store,
 		notify: notify,
 		log:    log,
@@ -106,6 +113,10 @@ func New(store *pool.Store, notify Notifier, log *slog.Logger, opts Options) *No
 		idle:   make(map[string][]net.Conn),
 		conns:  make(map[net.Conn]struct{}),
 	}
+	if opts.RDMAHelperSocket != "" {
+		node.rdma = NewRDMAHelper(opts.RDMAHelperSocket)
+	}
+	return node
 }
 
 // Endpoint returns the advertised endpoint.
@@ -247,6 +258,15 @@ func (n *Node) serveGet(conn net.Conn, req *protocol.Message) error {
 		resp.Status[i] = protocol.FetchOK
 		found = append(found, req.Keys[i])
 	}
+	if req.Push {
+		return n.servePush(conn, req, resp, slots, found, arena, sid)
+	}
+	if req.RDMA && n.rdma != nil {
+		handled, err := n.serveRDMA(conn, req, resp, slots, found, arena, sid)
+		if handled || err != nil {
+			return err
+		}
+	}
 	if err := writeFrame(conn, resp); err != nil {
 		return err
 	}
@@ -320,7 +340,17 @@ func (n *Node) Fetch(ctx context.Context, endpoint, ns string, keys [][]byte, ev
 		return nil, errors.New("pool not initialised")
 	}
 	sid := n.session()
-	defer n.store.ReleaseSession(sid)
+	// An RDMA failure with unknown state may leave writes in flight into
+	// the reserved slots. Then they are held until the helper that ran
+	// them has exited (quarantine), not freed at once.
+	unsafe := false
+	defer func() {
+		if !unsafe {
+			n.store.ReleaseSession(sid)
+			return
+		}
+		time.AfterFunc(n.helperWait(), func() { n.store.ReleaseSession(sid) })
+	}()
 
 	var slots []int64
 	var st []pool.AllocStatus
@@ -352,10 +382,73 @@ func (n *Node) Fetch(ctx context.Context, endpoint, ns string, keys [][]byte, ev
 		return status, nil
 	}
 
-	// Spread the blocks over several connections; one TCP stream does not
-	// fill a fast NIC.
 	start := time.Now()
 	ok := make([]bool, len(want))
+	mode := "tcp"
+	if n.rdmaReady(ctx) {
+		// Prefer a push: the source writes into our slots. A source that
+		// cannot push is read from instead, or sends over TCP.
+		mode = "rdma-write"
+		err = n.fetchPush(ctx, endpoint, ns, want, wantIdx, slots, status, ok, evict, arena)
+		if errors.Is(err, ErrNoRemoteRDMA) && !errors.Is(err, ErrRDMAUnsafe) {
+			mode = "rdma-read"
+			err = n.fetchRDMA(ctx, endpoint, ns, want, wantIdx, slots, status, ok, evict, arena)
+		}
+	} else {
+		err = n.fetchTCP(ctx, endpoint, ns, want, wantIdx, slots, status, ok, evict, arena)
+	}
+	if err != nil {
+		for j, i := range wantIdx {
+			if !ok[j] && status[i] == protocol.FetchOK {
+				status[i] = protocol.FetchFailed
+			}
+		}
+	}
+	var got uint64
+	for _, o := range ok {
+		if o {
+			got++
+		}
+	}
+	el := time.Since(start)
+	n.log.Info("fetched blocks", "source", endpoint, "blocks", got, "of", len(want),
+		"bytes", got*arena.SlotBytes(), "mode", mode, "ms", el.Milliseconds(),
+		"gbps", float64(got*arena.SlotBytes())*8/el.Seconds()/1e9)
+	commitKeys, commitOK := want, ok
+	if errors.Is(err, ErrRDMAUnsafe) {
+		unsafe = true
+		n.log.Warn("rdma fetch state unknown; holding its slots until the transfer has surely stopped",
+			"source", endpoint, "hold", n.helperWait(), "err", err)
+		// Commit only the blocks that arrived. The rest stay reserved, and
+		// the deferred release frees them after the quarantine.
+		commitKeys, commitOK = nil, nil
+		for j, o := range ok {
+			if o {
+				commitKeys = append(commitKeys, want[j])
+				commitOK = append(commitOK, true)
+			}
+		}
+	}
+	var stored []pool.KeyRef
+	var cerr error
+	n.notify.Ordered(func() {
+		stored, cerr = n.store.Commit(sid, ns, commitKeys, commitOK)
+		if len(stored) > 0 {
+			n.notify.AnnounceStored(ns, stored)
+		}
+	})
+	if cerr != nil && err == nil {
+		err = cerr
+	}
+	n.Fetched.Add(uint64(len(stored)))
+	return status, err
+}
+
+// fetchTCP pulls want over several TCP connections; one TCP stream does not
+// fill a fast NIC. Bytes go straight into the reserved slots.
+func (n *Node) fetchTCP(ctx context.Context, endpoint, ns string, want [][]byte, wantIdx []int,
+	slots []int64, status []uint8, ok []bool, evict bool, arena *pool.Arena,
+) error {
 	streams := n.opts.Streams
 	if streams > len(want) {
 		streams = len(want)
@@ -393,37 +486,7 @@ func (n *Node) Fetch(ctx context.Context, endpoint, ns string, keys [][]byte, ev
 		}(stream, lo, hi)
 	}
 	wg.Wait()
-	err = errors.Join(errs...)
-	if err != nil {
-		for j, i := range wantIdx {
-			if !ok[j] && status[i] == protocol.FetchOK {
-				status[i] = protocol.FetchFailed
-			}
-		}
-	}
-	var got uint64
-	for _, o := range ok {
-		if o {
-			got++
-		}
-	}
-	el := time.Since(start)
-	n.log.Info("fetched blocks", "source", endpoint, "blocks", got, "of", len(want),
-		"bytes", got*arena.SlotBytes(), "streams", streams, "ms", el.Milliseconds(),
-		"gbps", float64(got*arena.SlotBytes())*8/el.Seconds()/1e9)
-	var stored []pool.KeyRef
-	var cerr error
-	n.notify.Ordered(func() {
-		stored, cerr = n.store.Commit(sid, ns, want, ok)
-		if len(stored) > 0 {
-			n.notify.AnnounceStored(ns, stored)
-		}
-	})
-	if cerr != nil && err == nil {
-		err = cerr
-	}
-	n.Fetched.Add(uint64(len(stored)))
-	return status, err
+	return errors.Join(errs...)
 }
 
 // pull sends peer_get and calls each(j, found, conn) for every requested

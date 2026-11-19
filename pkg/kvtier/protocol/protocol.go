@@ -51,6 +51,13 @@ const (
 	// Requests between daemons, over TCP.
 	OpPeerGet   = "peer_get"   // send these blocks; raw block bytes follow the response
 	OpPeerOffer = "peer_offer" // please pull these keys from the named endpoint
+	// OpPeerRelease ends an RDMA peer_get: the destination has read the
+	// slots, and the source may drop its pins.
+	OpPeerRelease = "peer_release"
+
+	// OpRemotePush asks a source daemon to RDMA-write blocks straight into
+	// engine memory that the requesting engine registered with NIXL.
+	OpRemotePush = "remote_push"
 )
 
 // Per-key outcome of a fetch.
@@ -99,6 +106,19 @@ type Message struct {
 	Hashes   []uint64          `msgpack:"hashes,omitempty"`   // router hashes (push)
 	Evict    bool              `msgpack:"evict,omitempty"`    // the source drops what it sends
 	Failures map[uint64]string `msgpack:"failures,omitempty"` // push: hash -> reason
+
+	// RDMA peer_get: the source answers with slots and its RDMA helper's
+	// identity instead of block bytes, and the destination reads the slots.
+	RDMA      bool   `msgpack:"rdma,omitempty"`
+	Agent     string `msgpack:"agent,omitempty"`      // source helper's NIXL agent name
+	AgentMeta []byte `msgpack:"agent_meta,omitempty"` // source helper's NIXL metadata
+	Base      uint64 `msgpack:"base,omitempty"`       // address of the source pool's slot 0
+
+	// remote_push, and peer_get with Push: write the blocks into the
+	// destination's registered memory at DstAddrs, one address per key.
+	Push     bool     `msgpack:"push,omitempty"`
+	DstMeta  []byte   `msgpack:"dst_meta,omitempty"`  // destination's NIXL metadata
+	DstAddrs []uint64 `msgpack:"dst_addrs,omitempty"` // destination address per key
 
 	// stats
 	Stats map[string]any `msgpack:"stats,omitempty"`

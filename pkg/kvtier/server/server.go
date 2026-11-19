@@ -270,7 +270,7 @@ func (s *Server) handle(conn *net.UnixConn) {
 			}
 			return
 		}
-		if req.Op == protocol.OpFetch || req.Op == protocol.OpPush {
+		if req.Op == protocol.OpFetch || req.Op == protocol.OpPush || req.Op == protocol.OpRemotePush {
 			// These wait on the network; do not hold up the session's other
 			// requests.
 			go s.reply(ss, s.dispatch(ss, req))
@@ -429,6 +429,8 @@ func (s *Server) dispatch(ss *session, req *protocol.Message) *protocol.Message 
 				resp.Error = err.Error()
 			}
 		}
+	case protocol.OpRemotePush:
+		s.remotePush(ss, req, resp)
 	case protocol.OpPush:
 		if s.peer == nil {
 			resp.Error = "peer transfer is disabled on this daemon"

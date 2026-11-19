@@ -53,6 +53,8 @@ func main() {
 			"endpoint other daemons and routers use for this daemon, e.g. tcp://10.0.0.5:9401; defaults to the listen address")
 		peerTimeout = flag.Duration("peer-timeout", 30*time.Second, "time limit for one peer transfer")
 		peerStreams = flag.Int("peer-streams", 8, "TCP connections one fetch spreads its blocks over")
+		rdmaHelper  = flag.String("rdma-helper-socket", "",
+			"Unix socket of the node's RDMA helper (llmd_kv_tiering.rdma_helper); empty means TCP only")
 	)
 	flag.Parse()
 
@@ -91,10 +93,11 @@ func main() {
 	var node *peer.Node
 	if *peerListen != "" {
 		node = peer.New(store, srv, log, peer.Options{
-			ListenAddr: *peerListen,
-			Endpoint:   *peerAdvert,
-			Timeout:    *peerTimeout,
-			Streams:    *peerStreams,
+			ListenAddr:       *peerListen,
+			Endpoint:         *peerAdvert,
+			Timeout:          *peerTimeout,
+			Streams:          *peerStreams,
+			RDMAHelperSocket: *rdmaHelper,
 		})
 		if err := node.Listen(); err != nil {
 			log.Error("peer listen", "addr", *peerListen, "err", err)

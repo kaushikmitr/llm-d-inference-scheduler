@@ -169,6 +169,8 @@ class LLMDKVTierManager(SecondaryTierManager):
         locality: str | None = None,
         enable_kv_events: bool = True,
         opportunistic_query: bool = True,
+        rdma_zero_copy: bool = False,
+        rdma_parallel: int = 8,
     ) -> None:
         super().__init__(
             offloading_spec=offloading_spec,
@@ -186,6 +188,13 @@ class LLMDKVTierManager(SecondaryTierManager):
         # not survive vLLM's gRPC hint path (a protobuf Struct number is a
         # double).
         self._opportunistic = opportunistic_query
+        # With rdma_zero_copy, hinted blocks are read with RDMA from the
+        # source daemon's pool straight into vLLM's CPU tier, skipping the
+        # local pool. Needs an RDMA NIC and NIXL in the engine process.
+        self._zero_copy = rdma_zero_copy
+        self._rdma_parallel = rdma_parallel
+        self._reader = None
+        self._reader_lock = threading.Lock()
         self._client_name = f"vllm/{socket.gethostname()}/{os.getpid()}"
 
         # Address of the primary tier's first byte. Keep the array alive.
@@ -515,27 +524,88 @@ class LLMDKVTierManager(SecondaryTierManager):
         if failures := resp.get("failures"):
             logger.debug("%s %s: %d hashes failed", hint.action_type, hint.action_id, len(failures))
 
+    def _zero_copy_reader(self):
+        if not self._zero_copy:
+            return None
+        with self._reader_lock:
+            if self._reader is None:
+                try:
+                    from llmd_kv_tiering.zero_copy import ZeroCopyReader
+
+                    self._reader = ZeroCopyReader(
+                        self._primary_base,
+                        len(self._primary),
+                        self.block_size_bytes,
+                        self._rdma_parallel,
+                        self._timeout,
+                    )
+                except Exception:
+                    logger.exception("zero-copy RDMA reads unavailable; using pooled fetches")
+                    self._zero_copy = False
+                    return None
+            return self._reader
+
+    def _read_direct(
+        self,
+        client: DaemonClient,
+        keys: list[OffloadKey],
+        chunk_ids: list[int],
+        hints: _RequestHints | None,
+    ) -> set[OffloadKey]:
+        """Read hinted blocks straight into vLLM's CPU tier. Returns the keys
+        it loaded; the rest take the pooled path."""
+        if hints is None or not self._zero_copy:
+            return set()
+        groups: dict[str, list[tuple[OffloadKey, int]]] = {}
+        for key, cid in zip(keys, chunk_ids):
+            if key in self._mirror:
+                continue
+            hint = hints.source_for(key)
+            # Evict-on-fetch stays on the pooled path, which confirms the copy.
+            if hint is None or hint.evict_source:
+                continue
+            groups.setdefault(hint.endpoint, []).append((key, cid))
+        if not groups:
+            return set()
+        reader = self._zero_copy_reader()
+        if reader is None:
+            return set()
+        done: set[OffloadKey] = set()
+        for endpoint, items in groups.items():
+            try:
+                loaded, missing = reader.read(client, endpoint, [k for k, _ in items], [c for _, c in items])
+            except DaemonError as e:
+                logger.debug("zero-copy read from %s fell back to a pooled fetch: %s", endpoint, e)
+                continue
+            done.update(loaded)
+            hints.missing.update(missing)
+        return done
+
     def _run_load(self, job: TransferJob, hints: _RequestHints | None = None) -> JobResult:
         client = self._current()
         if client is None:
             return JobResult(job_id=job.job_id, success=False)
-        keys = list(job.keys)
+        all_keys = list(job.keys)
         t0 = time.monotonic()
+        direct = self._read_direct(client, all_keys, [int(c) for c in job.chunk_ids], hints)
+        rest = [(k, int(c)) for k, c in zip(all_keys, job.chunk_ids) if k not in direct]
+        keys = [k for k, _ in rest]
+        chunk_ids = [c for _, c in rest]
         self._fetch_hinted(client, keys, hints)
         t1 = time.monotonic()
-        slots = client.call("pin", keys=keys)["slots"]
+        slots = client.call("pin", keys=keys)["slots"] if keys else []
         t2 = time.monotonic()
         loaded: list[OffloadKey] = []
         pinned: list[OffloadKey] = []
         copies: list[tuple[int, int]] = []
         try:
-            for key, cid, slot in zip(keys, job.chunk_ids, slots):
+            for key, cid, slot in zip(keys, chunk_ids, slots):
                 if slot < 0:
                     continue
                 pinned.append(key)
                 copies.append((self._primary_address(int(cid)), client.arena.slot_address(slot)))
             self._copy_many(copies)
-            loaded = list(pinned)
+            loaded = list(pinned) + [k for k in all_keys if k in direct]
         finally:
             if pinned:
                 # The daemon drops a lost session's pins.
@@ -544,16 +614,17 @@ class LLMDKVTierManager(SecondaryTierManager):
         t3 = time.monotonic()
         size = self.block_size_bytes
         logger.debug(
-            "load job %d: %d/%d blocks, %.1f MB; fetch %.1f ms, pin %.1f ms, copy %.1f ms",
+            "load job %d: %d/%d blocks (%d read directly), %.1f MB; fetch %.1f ms, pin %.1f ms, copy %.1f ms",
             job.job_id,
             len(loaded),
-            len(keys),
+            len(all_keys),
+            len(direct),
             len(loaded) * size / 1e6,
             (t1 - t0) * 1e3,
             (t2 - t1) * 1e3,
             (t3 - t2) * 1e3,
         )
-        success = len(loaded) == len(keys)
+        success = len(loaded) == len(all_keys)
         return JobResult(
             job_id=job.job_id,
             success=success,

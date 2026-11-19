@@ -112,7 +112,7 @@ For reference, how this tier differs from KVCR v0.2.0, the tier the H200 results
 
 | | KVCR v0.2.0 | This tier |
 | --- | --- | --- |
-| Peer data path | NIXL (RDMA) | TCP, straight into pool slots. NIXL is milestone 5. |
+| Peer data path | NIXL (RDMA) | NIXL (RDMA) through a helper next to the daemon, or TCP. The source pushes with RDMA WRITE. |
 | What a peer serves | Engine-owned and KVCR-owned host memory | The daemon's pool only |
 | Hint results | Reported to the router | Logged only |
 | Endpoint | A KVCR control endpoint per engine rank | One daemon endpoint per node. A multi-host TPU replica will need one per host. |
@@ -128,7 +128,8 @@ For reference, how this tier differs from KVCR v0.2.0, the tier the H200 results
 4. Multi-host TPU replicas. One daemon per host. A block counts as a hit only when every host's daemon holds it, and a load is confirmed by every host. Hints name one endpoint per host, and host k pulls from host k of the source replica.
 5. A local SSD tier under the pool, and a policy interface that can be swapped at run time.
 6. llm-d router integration. The router consumes block events and emits hints. It publishes each pod's daemon endpoints. Prefetch of the next turn.
-7. NIXL/RDMA peer transfer through cgo, an object-store tier, and an SGLang shim.
+7. **Done.** RDMA peer transfer through NIXL, in a helper process next to the daemon. The source pushes with RDMA WRITE into the destination's pool, or into vLLM's CPU tier on GPU. Tested on H200 with RDMA NICs. The TPU path runs the same code, and was checked on TPU7x hosts with UCX over TCP, since those hosts have no RDMA NIC.
+8. An object-store tier, and an SGLang shim.
 
 ## Open questions
 

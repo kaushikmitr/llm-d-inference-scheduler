@@ -40,6 +40,12 @@ Only A's vLLM container was restarted. The `kvtierd` sidecar and its pool kept r
 | Computed before the restart (3 prompts) | 0.10 to 0.22 s | 8,960 |
 | Never seen (3 prompts) | 0.30 to 0.33 s | 0 |
 
+## RDMA path
+
+These TPU7x hosts have one standard NIC and no RDMA NIC, so RDMA itself could not be measured. The RDMA code path was checked over UCX's TCP transport instead (`UCX_TLS=tcp,self,sm`). A second daemon and an RDMA helper ran on each host, next to the running engines. One daemon fetched 35 blocks of 37.7 MB (1.32 GB) from the other. The source's helper wrote them into the destination's pool (`mode=rdma-write`). All 35 blocks matched their source checksums. The rate over UCX's TCP transport was 23 Gbit/s, against 108 to 118 Gbit/s on the daemon's own 8-stream TCP path. So on these hosts the daemon should run without the helper.
+
+The TPU image ships NIXL 0.3.0. The helper works with it.
+
 ## Limits
 
 - Single-host replicas only. With several hosts, each host holds a shard of every chunk, and a block may count as a hit only when every host's daemon holds it. The connector refuses to start on more than one host.

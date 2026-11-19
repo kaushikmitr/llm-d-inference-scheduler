@@ -39,10 +39,12 @@ def kvtierd_bin(tmp_path_factory) -> Path:
 
 
 class Daemon:
-    def __init__(self, binary: Path, socket_path: Path, slots: int) -> None:
+    def __init__(self, binary: Path, socket_path: Path, slots: int, extra_args: list[str] | None = None) -> None:
         self.binary = binary
         self.socket_path = socket_path
         self.slots = slots
+        self.extra_args = extra_args or []
+        self.log_path = socket_path.with_suffix(".log")
         self.proc: subprocess.Popen | None = None
 
     def start(self) -> Daemon:
@@ -58,8 +60,10 @@ class Daemon:
                 "--peer-listen",
                 "127.0.0.1:0",
                 "--log-level",
-                "warn",
-            ]
+                "info",
+                *self.extra_args,
+            ],
+            stderr=self.log_path.open("ab"),
         )
         deadline = time.monotonic() + 10
         while not self.socket_path.exists():
@@ -79,10 +83,10 @@ class Daemon:
 def daemon_factory(kvtierd_bin, tmp_path):
     daemons: list[Daemon] = []
 
-    def make(slots: int = 16, start: bool = True) -> Daemon:
+    def make(slots: int = 16, start: bool = True, extra_args: list[str] | None = None) -> Daemon:
         # Unix socket paths are limited to 108 bytes; keep it short.
         sock = Path(f"/tmp/kvtierd-{os.getpid()}-{len(daemons)}-{time.monotonic_ns()}.sock")
-        d = Daemon(kvtierd_bin, sock, slots)
+        d = Daemon(kvtierd_bin, sock, slots, extra_args)
         daemons.append(d)
         return d.start() if start else d
 
@@ -90,6 +94,7 @@ def daemon_factory(kvtierd_bin, tmp_path):
     for d in daemons:
         d.stop()
         d.socket_path.unlink(missing_ok=True)
+        d.log_path.unlink(missing_ok=True)
 
 
 @pytest.fixture

@@ -123,8 +123,36 @@ go build -o bin/kvtierd ./cmd/kvtierd
 | `--peer-endpoint` | the listen address | The endpoint routers put in hints, e.g. `tcp://10.0.0.5:9401` |
 | `--peer-timeout` | 30s | Time limit for one peer transfer |
 | `--peer-streams` | 8 | TCP connections one fetch spreads its blocks over |
+| `--rdma-helper-socket` | empty | Unix socket of the node's RDMA helper. Empty means TCP only |
 
 On Kubernetes, run the daemon as a sidecar or a DaemonSet. Share the socket directory with the engine through an `emptyDir` or `hostPath` volume.
+
+## RDMA
+
+Peer transfers can use RDMA through NIXL. Each node runs a helper next to the daemon:
+
+```bash
+python -m llmd_kv_tiering.rdma_helper --daemon-socket /run/kvtier/kvtierd.sock --listen-socket /run/kvtier/rdma.sock
+./bin/kvtierd ... --rdma-helper-socket /run/kvtier/rdma.sock
+```
+
+The helper maps the daemon's pool and registers it with NIXL. Daemons exchange NIXL metadata over their TCP peer connection, so the helper opens no port of its own.
+
+A fetch tries these in order:
+
+1. **Push.** The source's helper writes the blocks straight into the destination's pool slots with RDMA WRITE.
+2. **Read.** If the source has no helper, the destination's helper reads the blocks with RDMA READ.
+3. **TCP.** If neither side has a helper, the bytes go over TCP.
+
+A push is preferred because on 4 KiB-page memory an RDMA WRITE ran at about twice the bandwidth of a READ (see the [H200 results](docs/results-2026-11-18-h200.md#rdma)).
+
+**When a transfer fails.** Freeing a NIXL handle does not stop its DMA. So the helper waits until every transfer it started has finished or failed before it answers. If its deadline passes first, it answers "unsafe" and exits, which closes its RDMA connections and stops the transfers. The daemons' deadlines are spaced so that a daemon that gives up knows the helper has answered or exited. After an unsafe failure, the destination keeps the affected pool slots out of use until the helper has surely exited. In the GPU zero-copy path, vLLM's memory is re-registered under a new NIXL agent, so a late write fails at the NIC.
+
+**vLLM on GPU.** With `rdma_zero_copy: true` in the tier's options, the source writes straight into vLLM's CPU tier and skips the destination pool. This removes one host copy.
+
+**vLLM on TPU.** The TPU shim loads blocks to the device straight from the pool. A push into the pool is already the only host copy, so the TPU shim needs no RDMA option. Only the helper and the daemon flag are needed.
+
+**Network.** RDMA needs an RDMA NIC in the pod. On GKE A3 Ultra, claim one with the `mrdma.google.com` device class, add the `IPC_LOCK` capability to the helper, and set `UCX_IB_ROCE_REACHABILITY_MODE=all`. When GPUs are present, NIXL also needs `cuda_copy` in `UCX_TLS`, for example `rc_mlx5,rc,self,sm,cuda_copy`. TPU7x hosts on GKE have no RDMA NIC today. There, `UCX_TLS=tcp,self,sm` runs the same code path over TCP. That is useful as a functional check, but it is slower than the daemon's own TCP path.
 
 ## Development
 
