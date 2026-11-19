@@ -2,7 +2,7 @@
 
 A node-level KV cache tier for LLM inference engines. A Go daemon, `kvtierd`, runs once per node and owns a shared-memory pool of KV blocks. Each engine loads a thin shim that copies blocks between the engine's own CPU offload tier and that pool.
 
-Status: the daemon, the vLLM tier on GPU, and router hints with peer transfer, tested on H200 ([results](docs/results-2026-11-18-h200.md)). A shim for vLLM on TPU follows in a later change. See the [roadmap](docs/design.md#roadmap).
+Status: milestones 1 to 3 of the [roadmap](docs/design.md#roadmap). vLLM on GPU, tested on H200 ([results](docs/results-2026-11-18-h200.md)). vLLM on TPU for single-host replicas, tested on TPU7x ([results](docs/results-2026-11-18-tpu.md)).
 
 ## How it relates to `llmd_fs_backend`
 
@@ -53,6 +53,24 @@ Tier options:
 | `enable_kv_events` | true | Report this tier's blocks on vLLM's KV events, if KV events are enabled |
 
 If the daemon is down, the tier misses every lookup and fails every store. vLLM recomputes. The tier reconnects on its own.
+
+## How it plugs into vLLM on TPU
+
+tpu-inference uses its own offload connector. The TPU shim subclasses it, with no tpu-inference change:
+
+```bash
+vllm serve <model> --block-size=256 \
+  --kv-transfer-config '{
+    "kv_connector": "TPUOffloadConnector",
+    "kv_connector_module_path": "llmd_kv_tiering.tpu_connector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+      "llmd_socket_path": "/var/run/llmd-kv-tiering/kvtierd.sock"
+    }
+  }'
+```
+
+The name stays `TPUOffloadConnector` because the TPU platform accepts only its own connector names. The module path selects the subclass. Single-host replicas only for now. See [TPU](docs/design.md#tpu) in the design doc.
 
 ## Router hints
 
@@ -128,6 +146,6 @@ pkg/kvtier/policy                    eviction policies
 pkg/kvtier/peer                      block transfer between daemons
 pkg/kvtier/protocol                  daemon wire format
 pkg/kvtier/server                    Unix socket server
-kv_connectors/llmd_kv_tiering        engine shims: vLLM on GPU, router hints
+kv_connectors/llmd_kv_tiering        engine shims: vLLM on GPU, vLLM on TPU, router hints
 kv_connectors/llmd_kv_tiering/docs   design, roadmap and results
 ```

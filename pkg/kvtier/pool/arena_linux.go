@@ -15,6 +15,8 @@
 package pool
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"math"
 
@@ -32,6 +34,7 @@ type Arena struct {
 	data     []byte
 	slotSize uint64
 	numSlots int64
+	id       uint64
 }
 
 // ArenaOptions configure NewArena.
@@ -53,6 +56,10 @@ type ArenaOptions struct {
 func NewArena(opts ArenaOptions) (*Arena, error) {
 	if opts.SlotBytes == 0 {
 		return nil, fmt.Errorf("slot size %d must be positive", opts.SlotBytes)
+	}
+	var id [8]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return nil, fmt.Errorf("pool id: %w", err)
 	}
 	numSlots := opts.CapacityBytes / opts.SlotBytes
 	if numSlots == 0 {
@@ -85,8 +92,14 @@ func NewArena(opts ArenaOptions) (*Arena, error) {
 		return nil, fmt.Errorf("mmap %d bytes: %w", size, err)
 	}
 	slotCount := int64(numSlots) // #nosec G115 -- numSlots <= size, which is checked against MaxInt64 above
-	return &Arena{fd: fd, size: size, data: data, slotSize: opts.SlotBytes, numSlots: slotCount}, nil
+	return &Arena{
+		fd: fd, size: size, data: data, slotSize: opts.SlotBytes, numSlots: slotCount,
+		id: binary.BigEndian.Uint64(id[:]) | 1, // never 0, which means unknown
+	}, nil
 }
+
+// ID identifies this arena. A new arena gets a new random ID.
+func (a *Arena) ID() uint64 { return a.id }
 
 // FD returns the memfd to pass to clients.
 func (a *Arena) FD() int { return a.fd }

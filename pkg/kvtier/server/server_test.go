@@ -39,6 +39,7 @@ type client struct {
 	conn *net.UnixConn
 	mem  []byte
 	id   uint64
+	pool uint64 // the pool ID from hello
 }
 
 func startServer(t *testing.T, slots uint64) string {
@@ -152,6 +153,7 @@ func dial(t *testing.T, path, ns string) *client {
 		}
 	})
 	cl.id = 1
+	cl.pool = resp.PoolID
 	return cl
 }
 
@@ -437,5 +439,17 @@ func TestCloseDropsConnectionsBeforeHello(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestHelloNamesThePool(t *testing.T) {
+	path := startServer(t, 1)
+	a, b := dial(t, path, "ns"), dial(t, path, "other")
+	if a.pool == 0 || a.pool != b.pool {
+		t.Fatalf("pool ids %d and %d, want one nonzero id per pool", a.pool, b.pool)
+	}
+	// A restarted daemon has a new pool, with a new ID.
+	if c := dial(t, startServer(t, 1), "ns"); c.pool == 0 || c.pool == a.pool {
+		t.Fatalf("second pool id %d, first %d", c.pool, a.pool)
 	}
 }

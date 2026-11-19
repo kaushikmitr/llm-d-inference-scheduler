@@ -355,6 +355,7 @@ func (s *Server) hello(ss *session) error {
 	resp.Session = uint64(ss.id)
 	resp.ArenaBytes = arena.Size()
 	resp.NumSlots = arena.NumSlots()
+	resp.PoolID = arena.ID()
 	resp.SlotBytes = arena.SlotBytes()
 	if s.peer != nil {
 		resp.SelfEndpoint = s.peer.Endpoint()

@@ -133,6 +133,8 @@ class DaemonClient:
         self.session = hello["session"]
         self.arena: Arena = hello["arena"]
         self.num_slots: int = hello["num_slots"]
+        # Identifies the pool. A restarted daemon has a new pool and ID.
+        self.pool_id: int = hello.get("pool_id", 0)
         # The daemon's peer endpoint, which routers name in hints. None when
         # the daemon has peer transfer disabled.
         self.self_endpoint: str | None = hello.get("self_endpoint") or None

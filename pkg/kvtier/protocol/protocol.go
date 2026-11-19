@@ -77,7 +77,10 @@ type Message struct {
 	// hello response (the arena fd travels as SCM_RIGHTS)
 	ArenaBytes uint64 `msgpack:"arena_bytes,omitempty"`
 	NumSlots   int64  `msgpack:"num_slots,omitempty"`
-	Session    uint64 `msgpack:"session,omitempty"`
+	// PoolID identifies the pool. A restarted daemon has a new pool with a
+	// new ID, so a client can tell slot numbers of different pools apart.
+	PoolID  uint64 `msgpack:"pool_id,omitempty"`
+	Session uint64 `msgpack:"session,omitempty"`
 	// SelfEndpoint is this daemon's advertised peer endpoint, if any.
 	SelfEndpoint string `msgpack:"self_endpoint,omitempty"`
 
