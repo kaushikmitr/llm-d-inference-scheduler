@@ -55,6 +55,8 @@ func main() {
 		peerStreams = flag.Int("peer-streams", 8, "TCP connections one fetch spreads its blocks over")
 		rdmaHelper  = flag.String("rdma-helper-socket", "",
 			"Unix socket of the node's RDMA helper (llmd_kv_tiering.rdma_helper); empty means TCP only")
+		tokenFile = flag.String("control-token-file", "",
+			"file holding the token a router must send with a direct push (peer_push); empty disables direct push")
 	)
 	flag.Parse()
 
@@ -90,6 +92,18 @@ func main() {
 
 	srv := server.New(store, log)
 	srv.SetReleaseGrace(*grace)
+	token := ""
+	if *tokenFile != "" {
+		raw, err := os.ReadFile(*tokenFile)
+		if err != nil {
+			log.Error("read control token", "file", *tokenFile, "err", err)
+			os.Exit(1)
+		}
+		if token = strings.TrimSpace(string(raw)); token == "" {
+			log.Error("control token file is empty", "file", *tokenFile)
+			os.Exit(1)
+		}
+	}
 	var node *peer.Node
 	if *peerListen != "" {
 		node = peer.New(store, srv, log, peer.Options{
@@ -98,6 +112,7 @@ func main() {
 			Timeout:          *peerTimeout,
 			Streams:          *peerStreams,
 			RDMAHelperSocket: *rdmaHelper,
+			ControlToken:     token,
 		})
 		if err := node.Listen(); err != nil {
 			log.Error("peer listen", "addr", *peerListen, "err", err)

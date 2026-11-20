@@ -19,6 +19,8 @@ package pool
 import (
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/llm-d/llm-d-router/pkg/kvtier/policy"
@@ -373,6 +375,25 @@ func (s *Store) Resolve(ns string, hashes []uint64) map[uint64][][]byte {
 			out[h] = append(out[h], e.key)
 		}
 	}
+	return out
+}
+
+// Namespaces returns the namespaces that hold loadable blocks and start with
+// prefix.
+func (s *Store) Namespaces(prefix string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen := make(map[string]struct{})
+	for _, e := range s.byKey {
+		if e.state == ready && strings.HasPrefix(e.ns, prefix) {
+			seen[e.ns] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for ns := range seen {
+		out = append(out, ns)
+	}
+	sort.Strings(out)
 	return out
 }
 

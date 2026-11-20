@@ -51,6 +51,10 @@ const (
 	// Requests between daemons, over TCP.
 	OpPeerGet   = "peer_get"   // send these blocks; raw block bytes follow the response
 	OpPeerOffer = "peer_offer" // please pull these keys from the named endpoint
+	// OpPeerPush is the direct call a router makes to a source daemon: send
+	// the blocks with these router hashes to the named destination daemon.
+	// It needs the daemon's control token.
+	OpPeerPush = "peer_push"
 	// OpPeerRelease ends an RDMA peer_get: the destination has read the
 	// slots, and the source may drop its pins.
 	OpPeerRelease = "peer_release"
@@ -106,6 +110,8 @@ type Message struct {
 	Hashes   []uint64          `msgpack:"hashes,omitempty"`   // router hashes (push)
 	Evict    bool              `msgpack:"evict,omitempty"`    // the source drops what it sends
 	Failures map[uint64]string `msgpack:"failures,omitempty"` // push: hash -> reason
+	// Token authorises peer_push. It must equal the daemon's control token.
+	Token string `msgpack:"token,omitempty"`
 
 	// RDMA peer_get: the source answers with slots and its RDMA helper's
 	// identity instead of block bytes, and the destination reads the slots.

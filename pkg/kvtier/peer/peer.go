@@ -66,6 +66,9 @@ type Options struct {
 	// daemon serves its pool to peers that ask for RDMA. Empty means TCP
 	// only.
 	RDMAHelperSocket string
+	// ControlToken authorises peer_push, the direct call a router makes to
+	// move blocks. Empty disables peer_push.
+	ControlToken string
 }
 
 // Node is one daemon's peer endpoint: a server for other daemons and a
@@ -224,6 +227,8 @@ func (n *Node) serve(conn net.Conn) {
 			err = n.serveGet(conn, req)
 		case protocol.OpPeerOffer:
 			err = n.serveOffer(conn, req)
+		case protocol.OpPeerPush:
+			err = n.servePeerPush(conn, req)
 		default:
 			err = writeFrame(conn, &protocol.Message{ID: req.ID, Op: req.Op, Error: "unknown peer op " + req.Op})
 		}

@@ -39,11 +39,18 @@ type daemon struct {
 // enabled.
 func startDaemon(t *testing.T) daemon {
 	t.Helper()
+	return startDaemonWithToken(t, "")
+}
+
+// startDaemonWithToken starts a daemon that accepts direct pushes carrying
+// token. An empty token disables them.
+func startDaemonWithToken(t *testing.T, token string) daemon {
+	t.Helper()
 	const slots = 4
 	store := pool.NewStore(pool.ArenaOptions{CapacityBytes: slots * slotBytes}, func() policy.Policy { return policy.NewLRU() })
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := server.New(store, log)
-	node := peer.New(store, srv, log, peer.Options{ListenAddr: "127.0.0.1:0", Timeout: 5 * time.Second})
+	node := peer.New(store, srv, log, peer.Options{ListenAddr: "127.0.0.1:0", Timeout: 5 * time.Second, ControlToken: token})
 	if err := node.Listen(); err != nil {
 		t.Fatal(err)
 	}

@@ -436,23 +436,10 @@ func (s *Server) dispatch(ss *session, req *protocol.Message) *protocol.Message 
 			resp.Error = "peer transfer is disabled on this daemon"
 			break
 		}
-		found := s.store.Resolve(ss.ns, req.Hashes)
-		var keys [][]byte
-		for _, h := range req.Hashes {
-			ks, ok := found[h]
-			if !ok {
-				if resp.Failures == nil {
-					resp.Failures = map[uint64]string{}
-				}
-				resp.Failures[h] = "not_found"
-				continue
-			}
-			keys = append(keys, ks...)
-		}
-		if len(keys) > 0 {
-			if err := s.peer.Offer(context.Background(), req.Endpoint, ss.ns, keys, req.Evict); err != nil {
-				resp.Error = err.Error()
-			}
+		failures, err := s.peer.PushByHash(context.Background(), ss.ns, req.Hashes, req.Endpoint, req.Evict)
+		resp.Failures = failures
+		if err != nil {
+			resp.Error = err.Error()
 		}
 	case protocol.OpStats:
 		st := s.store.Stats()
