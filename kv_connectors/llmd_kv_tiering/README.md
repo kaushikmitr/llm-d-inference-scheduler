@@ -72,6 +72,25 @@ vllm serve <model> --block-size=256 \
 
 The name stays `TPUOffloadConnector` because the TPU platform accepts only its own connector names. The module path selects the subclass. Single-host replicas only for now. See [TPU](docs/design.md#tpu) in the design doc.
 
+### TPU Sync connector (proof of concept)
+
+`llmd_kv_tiering.tpusync_connector` is a second TPU path. It carries out the same hints with [TPU Sync](https://github.com/google/tpu-sync) and runs no kvtierd. TPU Sync copies blocks between TPU memory and host memory, and between hosts. Peers find each other through a TPU Sync global registry. A hint's control endpoint is reduced to its host, so a router sends the same hints to either path.
+
+```json
+{
+  "kv_connector": "RaidenOffloadConnector",
+  "kv_connector_module_path": "llmd_kv_tiering.tpusync_connector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {
+    "tpusync_registry": "registry-host:50051",
+    "tpusync_capacity_blocks": 4000
+  }
+}
+```
+
+The pod needs the `tpu-sync-jax` wheel and `POD_IP`. Blocks are saved when a request finishes. `kv.fetch` reads a peer's blocks into TPU memory. `kv.prefetch` offers a finished request's blocks to a peer. `kv.evict_on_fetch` and `kv.move` copy without deleting the source copy. Single-host replicas only. See the [first run](docs/results-2026-11-20-tpusync.md).
+
+
 ## Router hints
 
 A router can steer the tier with four hint actions: `kv.fetch`, `kv.evict_on_fetch`, `kv.prefetch` and `kv.move`. They use vLLM's KV hint envelope, so routers that already emit these actions work unchanged. A router can attach them in either of two ways. Neither needs a vLLM change.
