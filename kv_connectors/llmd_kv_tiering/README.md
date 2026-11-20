@@ -103,21 +103,26 @@ How the tier reads fetch hints:
 - **The first hint wins.** When several fetch hints name the same hash, the first one in the envelope is used.
 - **A plain `kv.fetch` covers the whole request.** Any block of the request that is not local is fetched from the hint's source, not only the listed hashes. Routers rely on this because 64-bit hashes do not survive every hint path: vLLM's gRPC path carries numbers as doubles. So llm-d's router sends a placeholder hash. Blocks the source does not have are recomputed. `kv.evict_on_fetch` is limited to the hashes it lists, because it deletes the source copy. Set the tier option `opportunistic_query: false` to fetch only listed hashes.
 
-## Direct push
+## Direct hints
 
-A router can ask a source daemon to move blocks without sending an inference request. It sends one `peer_push` message to the daemon's peer port:
+A router can send a prefetch or move hint straight to a source daemon, with no inference request. It sends one `peer_hints` message to the daemon's peer port:
 
 | Field | Meaning |
 | --- | --- |
 | `token` | The daemon's control token |
-| `ns` | The namespace of the blocks. A trailing `*` matches by prefix, so `Qwen/Qwen3-32B:*` covers every layout of that model |
-| `hashes` | The 64-bit router hashes of the blocks |
-| `endpoint` | The destination daemon, for example `tcp://10.0.0.7:9401` |
-| `evict` | True for a move: the source drops what it sent |
+| `model` | The model the hints are for. It selects that model's blocks in the pool |
+| `kv_hints` | A KV hint envelope, the same one a request would carry |
 
-The source offers the matching blocks to the destination, which pulls them. The reply lists the hashes the source did not hold. Go callers can use `peer.RequestPush`.
+The envelope may hold `kv.prefetch` and `kv.move` actions. Each names a `destination_control_endpoint` and lists `block_hashes`. The source offers the matching blocks to the destination, which pulls them. With `kv.move`, the source then drops its copy.
 
-Direct push is off unless the daemon runs with `--control-token-file`. The token guards only this message. The peer port itself is unauthenticated TCP, so restrict who can reach it, for example with a NetworkPolicy.
+The reply has two parts:
+
+- `failures` lists the hashes the source did not hold.
+- `rejected` lists the actions the daemon did not run, by action ID, with the reason. Other action types and other action versions are rejected.
+
+An envelope with another protocol version is refused whole. Go callers can use `peer.PrefetchHint` and `peer.SendHints`.
+
+Direct hints are off unless the daemon runs with `--control-token-file`. The token guards only this message. The peer port itself is unauthenticated TCP, so restrict who can reach it, for example with a NetworkPolicy.
 
 ## Running the daemon
 
@@ -140,7 +145,7 @@ go build -o bin/kvtierd ./cmd/kvtierd
 | `--peer-timeout` | 30s | Time limit for one peer transfer |
 | `--peer-streams` | 8 | TCP connections one fetch spreads its blocks over |
 | `--rdma-helper-socket` | empty | Unix socket of the node's RDMA helper. Empty means TCP only |
-| `--control-token-file` | empty | File holding the token a router must send with a direct push. Empty disables direct push |
+| `--control-token-file` | empty | File holding the token a router must send with direct hints. Empty disables direct hints |
 
 On Kubernetes, run the daemon as a sidecar or a DaemonSet. Share the socket directory with the engine through an `emptyDir` or `hostPath` volume.
 

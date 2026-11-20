@@ -51,10 +51,10 @@ const (
 	// Requests between daemons, over TCP.
 	OpPeerGet   = "peer_get"   // send these blocks; raw block bytes follow the response
 	OpPeerOffer = "peer_offer" // please pull these keys from the named endpoint
-	// OpPeerPush is the direct call a router makes to a source daemon: send
-	// the blocks with these router hashes to the named destination daemon.
-	// It needs the daemon's control token.
-	OpPeerPush = "peer_push"
+	// OpPeerHints is the direct call a router makes to a daemon. It carries
+	// a KV hint envelope, the same one a request would carry, and the
+	// daemon's control token.
+	OpPeerHints = "peer_hints"
 	// OpPeerRelease ends an RDMA peer_get: the destination has read the
 	// slots, and the source may drop its pins.
 	OpPeerRelease = "peer_release"
@@ -72,6 +72,34 @@ const (
 	FetchNoSpace uint8 = 3 // no free or evictable slot here
 	FetchFailed  uint8 = 4 // transfer error
 )
+
+// Versions and action types of the KV hint envelope. They match vLLM's
+// KvHintsEnvelope, so a router sends a daemon the hint it would attach to a
+// request.
+const (
+	HintProtocolVersion = "0.1"
+	HintActionVersion   = "1.0"
+	HintPrefetch        = "kv.prefetch"
+	HintMove            = "kv.move"
+	// Payload fields of kv.prefetch and kv.move.
+	HintDestinationField = "destination_control_endpoint"
+	HintBlockHashesField = "block_hashes"
+)
+
+// HintsEnvelope is vLLM's KV hint envelope.
+type HintsEnvelope struct {
+	ProtocolVersion string       `msgpack:"protocol_version"`
+	MessageID       string       `msgpack:"message_id"`
+	Actions         []HintAction `msgpack:"actions"`
+}
+
+// HintAction is one action of a hint envelope.
+type HintAction struct {
+	ActionID      string         `msgpack:"action_id"`
+	ActionType    string         `msgpack:"action_type"`
+	ActionVersion string         `msgpack:"action_version"`
+	Payload       map[string]any `msgpack:"payload"`
+}
 
 // Message is the single envelope for every request, response and event.
 // Each operation uses a subset of the fields.
@@ -110,8 +138,15 @@ type Message struct {
 	Hashes   []uint64          `msgpack:"hashes,omitempty"`   // router hashes (push)
 	Evict    bool              `msgpack:"evict,omitempty"`    // the source drops what it sends
 	Failures map[uint64]string `msgpack:"failures,omitempty"` // push: hash -> reason
-	// Token authorises peer_push. It must equal the daemon's control token.
-	Token string `msgpack:"token,omitempty"`
+	// peer_hints request: the control token, the model the hints are for,
+	// and the hint envelope. Namespace, when set, replaces Model: it names
+	// one namespace, or a prefix when it ends in "*".
+	Token string         `msgpack:"token,omitempty"`
+	Model string         `msgpack:"model,omitempty"`
+	Hints *HintsEnvelope `msgpack:"kv_hints,omitempty"`
+	// peer_hints response: the actions that were not run, by action ID,
+	// with the reason. Failures lists the hashes the source did not hold.
+	Rejected map[string]string `msgpack:"rejected,omitempty"`
 
 	// RDMA peer_get: the source answers with slots and its RDMA helper's
 	// identity instead of block bytes, and the destination reads the slots.

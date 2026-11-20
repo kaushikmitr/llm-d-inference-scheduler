@@ -56,7 +56,7 @@ func main() {
 		rdmaHelper  = flag.String("rdma-helper-socket", "",
 			"Unix socket of the node's RDMA helper (llmd_kv_tiering.rdma_helper); empty means TCP only")
 		tokenFile = flag.String("control-token-file", "",
-			"file holding the token a router must send with a direct push (peer_push); empty disables direct push")
+			"file holding the token a router must send with direct hints (peer_hints); empty disables direct hints")
 	)
 	flag.Parse()
 
